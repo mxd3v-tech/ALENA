@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Flask](https://img.shields.io/badge/Flask-3.x-000000?logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-опционально-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
-[![Docker Hub](https://img.shields.io/docker/image-size/mxd3v-tech/alena/latest?logo=docker&logoColor=white&label=Docker%20Hub&color=2496ED)](https://hub.docker.com/r/mxd3v-tech/alena)
+[![Docker Hub](https://img.shields.io/docker/image-size/mxd3v/alena/latest?logo=docker&logoColor=white&label=Docker%20Hub&color=2496ED)](https://hub.docker.com/r/mxd3v/alena)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 **Русский** · [English](#english)

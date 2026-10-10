@@ -108,9 +108,18 @@ def _get_pool():
                 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=8,
                                       open=False, kwargs={'autocommit': False})
                 pool.open()
-                with pool.connection() as conn, conn.cursor() as cur:
-                    for stmt in SCHEMA:
-                        cur.execute(stmt)
+                # Пока PostgreSQL поднимается (восстановление после
+                # нештатной остановки), connection() упадёт по таймауту.
+                # Пул тогда закрываем: иначе он остаётся жить со своими
+                # фоновыми потоками переподключения, а следующий запрос
+                # откроет ещё один.
+                try:
+                    with pool.connection() as conn, conn.cursor() as cur:
+                        for stmt in SCHEMA:
+                            cur.execute(stmt)
+                except BaseException:
+                    pool.close()
+                    raise
                 _pool = pool
     return _pool
 

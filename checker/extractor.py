@@ -10,7 +10,7 @@ import io
 from pathlib import Path
 
 import pdfplumber
-import fitz  # PyMuPDF
+import pymupdf as fitz
 from PIL import Image
 
 from checker.image_plagiarism import image_meta

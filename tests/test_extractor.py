@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 from checker import extractor
 from checker.extractor import _group_run, _identify_student, _is_task_page
