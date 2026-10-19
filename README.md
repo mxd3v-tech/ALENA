@@ -41,7 +41,7 @@
 
 | | Проверка | Как устроено |
 |---|---|---|
-| 📝 | **Заимствование текста** | Шинглы из 5-грамм слов, мера Жаккара, настраиваемый порог. В отчёте – матрица совпадений и дословные общие фрагменты |
+| 📝 | **Заимствование текста** | Шинглы из 5-грамм слов: доля текста меньшей работы, найденная в другой, – переписанная в отчёт методичка не тонет в скриншотах и самостоятельной части. Порог настраивается. В отчёте – матрица совпадений и дословные общие фрагменты |
 | 🖼 | **Дублирование изображений** | Перцептуальный хеш pHash 12×12 (144 бита) в трёх масштабах кадрирования – обрезанный по краям скриншот всё равно опознаётся |
 | 📐 | **ГОСТ 7.32-2017** | 22 критерия: 10 структурных и 12 по оформлению – от полей страницы до подписей рисунков |
 | 🎓 | **Рекомендуемая оценка** | Веса критериев нормируются к 100; готовый отзыв студенту формулируется словами замечания, а не пунктами стандарта |
@@ -451,7 +451,7 @@ submitted in September is recognised in December.
 
 | | Check | How it works |
 |---|---|---|
-| 📝 | **Text borrowing** | 5-gram word shingles, Jaccard similarity, configurable threshold. The report shows a match matrix and the verbatim shared passages |
+| 📝 | **Text borrowing** | 5-gram word shingles scored as the share of the smaller work found in the other – a manual pasted into a report is not diluted by screenshots and the student's own part. Configurable threshold. The report shows a match matrix and the verbatim shared passages |
 | 🖼 | **Duplicated images** | 12×12 perceptual hash (144-bit) at three crop scales – a screenshot trimmed at the edges is still recognised |
 | 📐 | **GOST 7.32-2017** | 22 criteria: 10 structural and 12 formatting – from page margins to figure captions |
 | 🎓 | **Recommended grade** | Per-criterion weights normalised to 100; the student-facing feedback is phrased as a remark, not as a clause number |

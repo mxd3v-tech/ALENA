@@ -1595,7 +1595,7 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
 <div class="section">
   <h2>Матрица схожести текстов</h2>
   <p class="subtitle" style="margin-bottom:var(--space-3);">
-    Жаккар по 5-граммам слов. Красный – выше порога {thr_pct}%, жёлтый – {int(thr_pct*0.55)}–{thr_pct}%.
+    Доля 5-грамм слов меньшей работы, найденных в другой. Красный – выше порога {thr_pct}%, жёлтый – {int(thr_pct*0.55)}–{thr_pct}%.
     {'Включены совпадения с предыдущими сессиями (выделены желтоватым фоном).' if historical_relevant else ''}
   </p>
   {matrix_html}

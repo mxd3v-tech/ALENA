@@ -82,12 +82,20 @@ class ShingleTests(unittest.TestCase):
         self.assertEqual(len(tp._shingles(' '.join(WORDS[:10]))),
                          10 - tp.SHINGLE_SIZE + 1)
 
-    def test_jaccard_of_a_text_with_itself_is_one(self):
-        shingles = tp._shingles(text())
-        self.assertEqual(tp._jaccard(shingles, shingles), 1.0)
+    def test_containment_of_a_text_with_itself_is_one(self):
+        shingles = tp._shingles(text(200))
+        self.assertEqual(tp._set_similarity(shingles, shingles), 1.0)
 
-    def test_jaccard_with_nothing_in_common_is_zero(self):
-        self.assertEqual(tp._jaccard(tp._shingles(text()), set()), 0.0)
+    def test_containment_with_nothing_in_common_is_zero(self):
+        self.assertEqual(tp._set_similarity(tp._shingles(text()), set()), 0.0)
+
+    def test_a_short_text_cannot_reach_full_containment(self):
+        """Из отчёта со скриншотами вместо текста извлекается один титульный
+        лист, общий для всей группы. По доле от меньшей работы он совпал бы
+        с каждой на 100 %."""
+        title = tp._shingles(text(50))
+        report = tp._shingles(text(50) + ' ' + text(400, tag='бета'))
+        self.assertLess(tp._set_similarity(title, report), 0.6)
 
 
 class ComparisonTests(unittest.TestCase):
@@ -107,7 +115,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result['matrix']['/a.pdf']['/a.pdf'], 1.0)
 
     def test_the_threshold_decides_what_counts_as_borrowing(self):
-        # Половина текста общая: примерно треть по Жаккару.
+        # Половина текста общая: меньше половины шинглов каждой работы.
         half = text(30)
         pair = [work('/a.pdf', body=half + ' ' + text(30, tag='бета')),
                 work('/b.pdf', body=half + ' ' + text(30, tag='гамма'))]
@@ -122,6 +130,40 @@ class ComparisonTests(unittest.TestCase):
                 work('/b.pdf', body=half + ' ' + text(30, tag='гамма'))]
         matrix = check_text_plagiarism(pair, threshold=0.6)['matrix']
         self.assertGreater(matrix['/a.pdf']['/b.pdf'], 0)
+
+    def test_a_manual_pasted_into_a_longer_report_is_flagged(self):
+        """Студенты переписывают методичку целиком, заменяя её листинги
+        скриншотами и добавляя титул и самостоятельную часть. По Жаккару
+        общее делилось на объединение двух текстов, и дословная копия
+        получала 42 % – ниже порога; ни одна из пяти таких работ не нашлась.
+        """
+        steps = [text(40, tag=f'шаг{i}') for i in range(8)]
+        listings = [text(15, tag=f'листинг{i}') for i in range(8)]
+        manual = ' '.join(f'{step} {listing}'
+                          for step, listing in zip(steps, listings))
+        student = ' '.join([text(45, tag='титул'), *steps,
+                            text(120, tag='своё')])
+        result = check_text_plagiarism(
+            [work('/manual.docx', body=manual),
+             work('/student.docx', body=student,
+                  student={'name': 'Иванов Иван', 'group': 'ИВТ'})],
+            threshold=0.6)
+        self.assertEqual(len(result['pairs']), 1)
+
+    def test_the_same_manual_matches_through_the_stored_base(self):
+        """Тот же случай, когда методичка проверяется против базы: там
+        работает отсев кандидатов, и он не должен терять такие пары."""
+        steps = [text(40, tag=f'шаг{i}') for i in range(8)]
+        manual = ' '.join(f'{step} {text(15, tag=f"листинг{i}")}'
+                          for i, step in enumerate(steps))
+        student = ' '.join([text(45, tag='титул'), *steps,
+                            text(120, tag='своё')])
+        old = work('memory://k|v1', is_historical=True,
+                   student={'name': 'Иванов Иван', 'group': 'ИВТ'},
+                   normalized_text=normalize_text(student))
+        result = check_text_plagiarism([work('/manual.docx', body=manual), old],
+                                       threshold=0.6)
+        self.assertEqual(len(result['pairs']), 1)
 
     def test_a_junk_threshold_falls_back_to_the_default(self):
         for value in (None, 'много', float('nan'), -1, 2):

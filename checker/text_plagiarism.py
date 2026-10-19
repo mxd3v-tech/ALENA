@@ -1,4 +1,4 @@
-"""Text plagiarism detection via word n-gram (shingle) Jaccard similarity."""
+"""Text plagiarism detection via word n-gram (shingle) containment."""
 import hashlib
 import itertools
 import math
@@ -15,6 +15,19 @@ MIN_PASSAGE_WORDS = 8   # min words to display a common passage
 # помечаются отдельно: заимствование в них проверяют глазами.
 MIN_COMPARE_WORDS = 30
 PREFILTER_SAMPLE_SIZE = 128
+
+# Схожесть – доля шинглов меньшей работы, найденных в другой, а не Жаккар.
+# Жаккар делит общее на объединение, и вставленная целиком в отчёт методичка
+# тонула в чужом: студент заменил листинги команд скриншотами, дописал титул
+# и «самостоятельную работу» – и работа, дословно совпадающая с методичкой,
+# получала 42 % при пороге 60 %. Доля от меньшей работы этого не боится.
+#
+# Знаменатель не опускается ниже этого числа шинглов: иначе отчёт, из
+# которого кроме титульного листа ничего не извлеклось (тело – сплошные
+# скриншоты), совпадал бы на 100 % со всеми работами группы по общему титулу.
+# Жаккар остаётся нижней границей, чтобы две одинаковые короткие работы по-
+# прежнему совпадали полностью.
+MIN_CONTAINMENT_SHINGLES = 150
 
 
 def normalize_text(text: str) -> str:
@@ -72,7 +85,7 @@ def anonymous_work_key(report: dict):
 def _shingles(text: str, n: int = SHINGLE_SIZE) -> set:
     """Множество хешей словесных n-грамм.
 
-    Хеши, а не сами кортежи слов: для Жаккара нужны только совпадения, а
+    Хеши, а не сами кортежи слов: для схожести нужны только совпадения, а
     отчёт на сорок страниц даёт двенадцать тысяч n-грамм – кортежами это
     2 МБ на работу, и при сравнении с базой в сотни отчётов память кончается.
     Совпадение хешей 64-битное: ложное пересечение на таких объёмах невероятно.
@@ -86,12 +99,17 @@ def _shingles(text: str, n: int = SHINGLE_SIZE) -> set:
     return {hash(tuple(words[i:i + n])) for i in range(len(words) - n + 1)}
 
 
-def _jaccard(a: set, b: set) -> float:
+def _similarity(a: set, b: set, intersection: int) -> float:
+    union = len(a) + len(b) - intersection
+    jaccard = intersection / union if union else 0.0
+    base = max(min(len(a), len(b)), MIN_CONTAINMENT_SHINGLES)
+    return max(jaccard, intersection / base)
+
+
+def _set_similarity(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
-    inter = len(a & b)
-    union = len(a) + len(b) - inter
-    return inter / union if union else 0.0
+    return _similarity(a, b, len(a & b))
 
 
 def _shingle_sample(shingles: set) -> set:
@@ -101,9 +119,9 @@ def _shingle_sample(shingles: set) -> set:
     return set(itertools.islice(shingles, PREFILTER_SAMPLE_SIZE))
 
 
-def _candidate_jaccard(a: set, sample_a: set, b: set, sample_b: set,
-                       threshold: float):
-    """Exact Jaccard for a viable candidate, otherwise ``None`` early.
+def _candidate_similarity(a: set, sample_a: set, b: set, sample_b: set,
+                          threshold: float):
+    """Exact similarity for a viable candidate, otherwise ``None`` early.
 
     The 128-value sample is checked first. We then inspect only as much of the
     smaller set as needed to prove that the required intersection is
@@ -119,10 +137,7 @@ def _candidate_jaccard(a: set, sample_a: set, b: set, sample_b: set,
 
     def _can_reach(intersection: int, remaining: int) -> bool:
         upper_intersection = min(len(other), intersection + remaining)
-        upper_union = len(a) + len(b) - upper_intersection
-        upper_similarity = (upper_intersection / upper_union
-                            if upper_union else 0.0)
-        return upper_similarity >= threshold
+        return _similarity(a, b, upper_intersection) >= threshold
 
     if not _can_reach(0, len(source)):
         return None
@@ -144,8 +159,7 @@ def _candidate_jaccard(a: set, sample_a: set, b: set, sample_b: set,
         if not _can_reach(intersection, len(source) - checked):
             return None
 
-    union = len(a) + len(b) - intersection
-    return intersection / union if union else 0.0
+    return _similarity(a, b, intersection)
 
 
 def _find_passages(words1: list, words2: list) -> list:
@@ -269,10 +283,10 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
         compared[p1] += 1
         compared[p2] += 1
 
-        sim = (_candidate_jaccard(
+        sim = (_candidate_similarity(
             first_set, first_sample, second_set, second_sample, threshold)
             if prefilter and threshold > 0
-            else _jaccard(first_set, second_set))
+            else _set_similarity(first_set, second_set))
         if sim is None:
             return
         matrix[p1][p2] = sim
