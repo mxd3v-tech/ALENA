@@ -12,7 +12,7 @@
   </div>
   <div class="tile">
     <span class="eyebrow">Сдали без замечаний</span>
-    <span class="tile-val">{{ clean_pct }}%</span>
+    <span class="tile-val">{{ clean_pct ~ '%' if scored else '–' }}</span>
     <span class="tile-foot">{{ clean }} из {{ scored }} отчётов</span>
   </div>
   <div class="tile">
@@ -27,7 +27,7 @@
   </div>
   <div class="tile">
     <span class="eyebrow">{% if can(user, 'see_all') %}Преподавателей{% else %}Средний балл ГОСТ{% endif %}</span>
-    <span class="tile-val">{% if can(user, 'see_all') %}{{ teachers }}{% else %}{{ avg_gost }}%{% endif %}</span>
+    <span class="tile-val">{% if can(user, 'see_all') %}{{ teachers }}{% else %}{{ avg_gost ~ '%' if avg_gost is not none else '–' }}{% endif %}</span>
     <span class="tile-foot">{% if can(user, 'see_all') %}запускали проверки{% else %}по завершённым проверкам{% endif %}</span>
   </div>
 </div>
@@ -37,7 +37,7 @@
     <div class="section-head"><h2>Проверок по дням</h2><span class="spacer"></span>
       <span class="eyebrow">Последние {{ series | length }} дней с проверками</span></div>
     <div class="section-body">
-      <div class="chart-wrap" id="line-chart" data-series="{{ series | tojson }}"></div>
+      <div class="chart-wrap" id="line-chart" data-series='{{ series | tojson }}'></div>
     </div>
   </div>
 
@@ -77,11 +77,11 @@
       <tbody>
         {% for r in recent %}
         <tr>
-          <td><a class="mono" href="{{ url_for('report', job_id=r.job_id) }}" target="_blank" rel="noopener">#{{ r.job_id[:6] }}</a></td>
-          <td>{{ r.summary.group if r.summary else '–' }}</td>
+          <td>{% if r.has_report %}<a class="mono" href="{{ url_for('report', job_id=r.job_id) }}" target="_blank" rel="noopener">#{{ r.job_id[:6] }}</a>{% else %}<span class="mono">#{{ r.job_id[:6] }}</span> <span class="sub">{{ {'processing': 'Выполняется', 'cancelled': 'Прервана', 'error': 'Ошибка'}.get(r.status, 'Отчёт недоступен') }}</span>{% endif %}</td>
+          <td>{{ r.summary.groups | join(', ') or '–' if r.summary else '–' }}</td>
           {% if can(user, 'see_all') %}<td>{{ r.owner_fio or '–' }}</td>{% endif %}
           <td class="num">{{ r.total or 0 }}</td>
-          <td class="num">{% if r.summary %}{{ r.summary.gost }}%{% else %}–{% endif %}</td>
+          <td class="num">{{ r.summary.gost ~ '%' if r.summary and r.summary.get('gost') is not none else '–' }}</td>
           <td class="num">{% if r.summary %}{{ r.summary.plag }}%{% else %}–{% endif %}</td>
           <td class="mono sub">{{ r.created_at }}</td>
         </tr>

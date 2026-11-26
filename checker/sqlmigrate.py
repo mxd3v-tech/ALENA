@@ -264,6 +264,7 @@ def _check_summary(summary):
     _require(type(summary.get('plag_flagged', False)) is bool, 'jobs.summary.plag_flagged')
     if 'clean' in summary:
         _require(_integer(summary['clean']), 'jobs.summary.clean')
+    _require(_strings(summary.get('groups', [])), 'jobs.summary.groups')
     fails = summary.get('fail_counts', [])
     _require(isinstance(fails, list) and all(isinstance(pair, list) and len(pair) == 2
              and isinstance(pair[0], str) and _integer(pair[1]) for pair in fails),
@@ -275,6 +276,8 @@ def _check_summary(summary):
     for student in summary.get('students', []):
         _require(isinstance(student.get('fio'), str) and _strings(student.get('fails', [])),
                  'jobs.summary.students')
+        _require(isinstance(student.get('filename', ''), str), 'jobs.students.filename')
+        _require('work_id' not in student or _integer(student['work_id']), 'jobs.students.work_id')
         _require(student.get('gost') is None or _integer(student['gost']), 'jobs.students.gost')
         _require(student.get('plag') is None or _percentage(student['plag']), 'jobs.students.plag')
         _require(type(student.get('plag_flagged', False)) is bool, 'jobs.students.plag_flagged')
@@ -291,8 +294,12 @@ def _check_summary(summary):
                  'jobs.students.flaws')
     for match in summary.get('matches', []):
         _require(match.get('pct') is None or _percentage(match['pct']), 'jobs.matches.pct')
-        _require(isinstance(match.get('pages', []), list) and
-                 all(_integer(n) for n in match.get('pages', [])), 'jobs.matches.pages')
+        for field in ('pages', 'b_pages'):
+            pages = match.get(field, [])
+            _require(isinstance(pages, list) and all(_integer(n) for n in pages),
+                     f'jobs.matches.{field}')
+        for field in ('a_id', 'b_id'):
+            _require(field not in match or _integer(match[field]), f'jobs.matches.{field}')
 
 
 def _validate(table, rec):

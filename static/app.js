@@ -10,10 +10,41 @@
   /* Токен сессии: сервер принимает изменяющий запрос только с ним, иначе
      страницу можно было бы отправить с чужого сайта от имени вошедшего. */
   const CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
-  const post = (url, opts = {}) => fetch(url, Object.assign({}, opts, {
-    method: 'POST',
-    headers: Object.assign({ 'X-CSRF-Token': CSRF }, opts.headers || {}),
-  }));
+  async function requestJson(url, options = {}) {
+    let res;
+    try {
+      res = await fetch(url, { ...options, headers: { Accept: 'application/json', ...options.headers } });
+    } catch {
+      throw new Error('Связь с сервером прервалась.');
+    }
+    if (res.redirected) {
+      throw Object.assign(new Error('Обновите страницу и проверьте вход в систему.'), { status: 401 });
+    }
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || typeof data !== 'object') {
+      const message = data?.error || (res.ok ? 'Сервер вернул неожиданный ответ.' : `Ошибка сервера (${res.status}).`);
+      throw Object.assign(new Error(message), { status: res.status });
+    }
+    return data;
+  }
+
+  async function postAction(url, body) {
+    try {
+      const options = { method: 'POST', headers: { 'X-CSRF-Token': CSRF } };
+      if (body) {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(body);
+      }
+      const data = await requestJson(url, options);
+      if (data.ok !== true) throw new Error(data.error || 'Сервер не подтвердил действие.');
+      return true;
+    } catch (err) {
+      toast(err.message);
+      return false;
+    }
+  }
+
+  const accessDenied = err => err.status === 401 || err.status === 403;
 
   /* ── Общее: тема, меню, всплывающие сообщения ── */
 
@@ -114,9 +145,12 @@
         ta.value = text;
         ta.style.cssText = 'position:fixed;opacity:0';
         document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        ta.remove();
+        try {
+          ta.select();
+          if (!document.execCommand('copy')) throw new Error('copy failed');
+        } finally {
+          ta.remove();
+        }
       }
       toast(okMessage);
     } catch (e) {
@@ -169,7 +203,8 @@
     idle: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5l3 2" stroke-linecap="round"/></svg>',
   };
   const chip = (tone, text) => `<span class="chip ${tone}">${ICON[tone]}${esc(text)}</span>`;
-  const gostTone = v => v >= 85 ? 'ok' : v >= 70 ? 'warn' : 'crit';
+  const gostTone = v => v == null ? 'idle' : v >= 85 ? 'ok' : v >= 70 ? 'warn' : 'crit';
+  const gostScore = v => v == null ? '–' : v + '%';
   const plagTone = (v, threshold, flagged = v >= threshold) =>
     flagged ? 'crit' : threshold > 0 && v >= threshold * 0.6 ? 'warn' : 'ok';
   const toneVar = t => `var(--${t})`;
@@ -248,7 +283,7 @@
     if (st.group) head += `, ${st.group}`;
     const body = lines.length
       ? 'Замечания по оформлению:\n' + lines.map(l => '• ' + l).join('\n')
-      : 'Замечаний по оформлению нет.';
+      : st.gost === null ? 'ГОСТ не проверялся.' : 'Замечаний по оформлению нет.';
     const g = st.no_text ? {} : (st.grade || {});
     let tail = '';
     if (g.pct != null) {
@@ -266,20 +301,34 @@
      человека, где текст и изображения идут вместе. Работа из этой же пачки
      видна с обеих сторон: и у Иванова, и у Петрова. */
   function groupMatches(matches, students) {
-    const groupOf = new Map((students || []).map(st => [st.fio, st.group || '']));
-    const people = new Map();
-
-    const person = (fio, group) => {
-      let p = people.get(fio);
-      if (!p) people.set(fio, p = { fio, group: group || groupOf.get(fio) || '', links: new Map() });
-      if (!p.group && group) p.group = group;
-      return p;
+    // Old summaries may have names but no originating group or file IDs.
+    const groupOf = new Map();
+    const filenames = new Map();
+    for (const st of students || []) {
+      if (st.work_id != null) filenames.set(st.work_id, st.filename);
+      const group = st.group || '';
+      if (!groupOf.has(st.fio)) groupOf.set(st.fio, group);
+      else if (groupOf.get(st.fio) !== group) groupOf.set(st.fio, '');
+    }
+    const works = new Map();
+    const labelCounts = new Map();
+    const work = (id, fio, group, where) => {
+      const label = JSON.stringify([fio, group]);
+      const key = id != null ? String(id) : JSON.stringify([fio, group, where]);
+      if (!works.has(key)) {
+        works.set(key, { key, id, fio, group, label, links: new Map() });
+        labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+      }
+      return works.get(key);
     };
-    const link = (p, fio, group, where) => {
-      const key = fio + '|' + group;
-      let l = p.links.get(key);
-      if (!l) p.links.set(key, l = { fio, group, where, pct: null, img: false, pages: [] });
-      return l;
+
+    const record = (from, to, where, pct, pages) => {
+      if (!from.links.has(to.key)) {
+        from.links.set(to.key, { other: to, where, pct: null, img: false, pages: [] });
+      }
+      const l = from.links.get(to.key);
+      if (pct == null) { l.img = true; l.pages.push(...pages); }
+      else if (l.pct == null || pct > l.pct) l.pct = pct;
     };
 
     for (const m of (matches || [])) {
@@ -298,22 +347,26 @@
       const pages = m.pages
         || (img ? (String(m.kind || '').match(/\d+/g) || []).map(Number) : []);
 
-      const fill = l => {
-        if (img) { l.img = true; l.pages.push(...pages); }
-        else if (l.pct == null || m.pct > l.pct) l.pct = m.pct;
-      };
-      fill(link(person(aFio, aGroup), bFio, bGroup, m.where));
-      if (bNew) fill(link(person(bFio, bGroup), aFio, aGroup, 'в этой пачке'));
+      const a = work(m.a_id, aFio, aGroup, 'в этой пачке');
+      const b = work(m.b_id, bFio, bGroup || '', bNew ? 'в этой пачке' : m.where);
+      record(a, b, m.where, m.pct, pages);
+      // Old digests only know the page in work A.
+      if (bNew) record(b, a, 'в этой пачке', m.pct, m.b_pages || []);
     }
 
-    const list = [...people.values()].map(p => {
-      const links = [...p.links.values()];
-      links.forEach(l => { l.pages = [...new Set(l.pages)].sort((x, y) => x - y); });
-      // Доля неизвестна только у дублей картинок – они уходят вниз списка.
-      links.sort((x, y) => (y.pct == null ? -1 : y.pct) - (x.pct == null ? -1 : x.pct)
-                        || x.fio.localeCompare(y.fio, 'ru'));
+    const display = w => {
+      if (w.id == null || labelCounts.get(w.label) === 1) return w.fio;
+      const file = filenames.get(w.id);
+      return `${w.fio} · №${w.id}${file ? ' · ' + file : ''}`;
+    };
+    const list = [...works.values()].filter(w => w.links.size).map(p => {
+      const links = [...p.links.values()].map(l => ({
+        fio: display(l.other), group: l.other.group, where: l.where, pct: l.pct, img: l.img,
+        pages: [...new Set(l.pages)].sort((x, y) => x - y),
+      }));
+      links.sort((x, y) => (y.pct ?? -1) - (x.pct ?? -1) || x.fio.localeCompare(y.fio, 'ru'));
       const pcts = links.map(l => l.pct).filter(v => v != null);
-      return { fio: p.fio, group: p.group, links, top: pcts.length ? Math.max(...pcts) : null };
+      return { key: p.key, fio: display(p), group: p.group, links, top: pcts.length ? Math.max(...pcts) : null };
     });
     list.sort((a, b) => a.fio.localeCompare(b.fio, 'ru'));
     return list;
@@ -340,6 +393,13 @@
   const checksRoot = $('#checks-screen');
   if (checksRoot) initChecks();
 
+  function batchGroups(s) {
+    if (Array.isArray(s.groups)) return s.groups;
+    // Older summaries kept only the first group at the top level.
+    return [...new Set([s.group, ...(s.students || []).map(st => st.group)]
+      .filter(group => typeof group === 'string' && group && group !== '–'))];
+  }
+
   function initChecks() {
     const seesAll = checksRoot.dataset.seesAll === '1';
     const canDelete = checksRoot.dataset.canDelete === '1';
@@ -350,7 +410,7 @@
     let query = '';
     let timer = null;
     let foldOpen = false;
-    let matchOpen = new Set();   // раскрытые ФИО в «Совпадениях»
+    let matchOpen = new Set();   // раскрытые работы в «Совпадениях»
 
     const visible = () => {
       const list = Object.entries(records).map(([id, d]) => ({ id, ...d }));
@@ -362,20 +422,37 @@
       const qd = q.replace(/[/-]/g, '.');
       return list.filter(j =>
         j.id.includes(q) ||
-        String((j.summary && j.summary.group) || '').toLowerCase().includes(q) ||
+        batchGroups(j.summary || {}).some(group => group.toLowerCase().includes(q)) ||
         stampForms(j.created_at).some(f => f.includes(qd)) ||
         ((j.summary && j.summary.students) || []).some(s => s.fio.toLowerCase().includes(q)));
     };
 
+    let lastRequest = 0;
     async function load() {
+      clearTimeout(timer);
+      const request = ++lastRequest;
+      const notice = $('#jobs-load-status');
       try {
-        const res = await fetch('/jobs', { headers: { Accept: 'application/json' } });
-        if (!res.ok) return;
-        records = await res.json();
-      } catch (e) { return; }
+        const data = await requestJson('/jobs');
+        if (request !== lastRequest) return;
+        records = data;
+      } catch (err) {
+        if (request !== lastRequest) return;
+        notice.hidden = false;
+        notice.textContent = err.message;
+        if (accessDenied(err)) {
+          records = {};
+          render();
+        } else {
+          notice.textContent += ' Повторяем загрузку списка…';
+          timer = setTimeout(load, 2000);
+        }
+        if (!Object.keys(records).length) $('#job-list').innerHTML = '';
+        return;
+      }
+      notice.hidden = true;
       render();
       const running = Object.values(records).some(d => d.status === 'processing');
-      clearTimeout(timer);
       if (running) timer = setTimeout(load, 2000);
     }
 
@@ -407,11 +484,11 @@
           <button class="job" data-job="${esc(j.id)}" style="--tone:${toneVar(tone)}" aria-selected="${j.id === selected}">
             <span class="job-top">
               <span class="job-id mono">#${esc(j.id.slice(0, 6))}</span>
-              <span class="job-group">${esc(s.group || '–')}</span>
+              <span class="job-group">${esc(batchGroups(s).join(', ') || '–')}</span>
             </span>
             <span class="job-meta">
               <span class="mono">${j.total || 0}</span> файлов
-              ${j.status === 'done' ? `· ГОСТ <span class="mono">${s.gost || 0}%</span>` : ''}
+              ${j.status === 'done' ? `· ГОСТ <span class="mono">${gostScore(s.gost)}</span>` : ''}
               <span style="margin-left:auto;">${right}</span>
             </span>
             <span class="job-meta"><span class="mono">${esc(j.created_at || '')}</span>${seesAll && j.owner_fio ? ' · ' + esc(j.owner_fio) : ''}</span>
@@ -435,8 +512,8 @@
 
     function renderTiles(list) {
       const done = list.filter(j => j.status === 'done' && j.summary);
-      const files = list.reduce((n, j) => n + (j.total || 0), 0);
-      const gosts = done.map(j => j.summary.gost).filter(v => v);
+      const files = list.reduce((n, j) => n + (j.done_files ?? (j.status === 'done' ? j.total : 0) ?? 0), 0);
+      const gosts = done.map(j => j.summary.gost).filter(v => v != null);
       const matches = done.reduce((n, j) =>
         n + (j.summary.matches_total != null
           ? j.summary.matches_total : (j.summary.matches || []).length), 0);
@@ -458,7 +535,7 @@
       const head = `
         <div class="detail-head">
           <div class="detail-title">
-            <h2>${esc(s.group || 'Проверка')}</h2>
+            <h2>${esc(batchGroups(s).join(', ') || 'Проверка')}</h2>
             <span class="mono">#${esc(j.id)}</span>
             ${j.status === 'done' ? chip('ok', 'Готово')
               : j.status === 'processing' ? chip('idle', 'Выполняется')
@@ -522,7 +599,7 @@
         wireDelete(); return;
       }
 
-      const gt = gostTone(s.gost || 0), pt = plagTone(s.plag || 0, thr, s.plag_flagged);
+      const gt = gostTone(s.gost), pt = plagTone(s.plag || 0, thr, s.plag_flagged);
       const mark = s.grade == null ? null : s.grade;
       const mt = mark == null ? 'idle' : gostTone(mark);
       const markMeter = mark == null ? '' : `
@@ -539,10 +616,10 @@
         <div class="meters">
           <div>
             <div class="meter-top"><span class="meter-label">Соответствие ГОСТ 7.32-2017</span>
-              <span class="meter-val" style="color:${toneVar(gt)}">${s.gost || 0}%</span></div>
+              <span class="meter-val" style="color:${toneVar(gt)}">${gostScore(s.gost)}</span></div>
             <div class="track"><div class="fill" style="width:${s.gost || 0}%;--tone:${toneVar(gt)}"></div></div>
             <div class="meter-note">Средняя доля пройденных критериев
-              ${chip(gt, gt === 'ok' ? 'В норме' : gt === 'warn' ? 'Есть замечания' : 'Много нарушений')}</div>
+              ${chip(gt, gt === 'idle' ? 'ГОСТ не проверялся' : gt === 'ok' ? 'В норме' : gt === 'warn' ? 'Есть замечания' : 'Много нарушений')}</div>
           </div>
           ${markMeter}
           <div>
@@ -572,7 +649,7 @@
           : `<td class="num" style="color:${toneVar(plagTone(st.plag, thr, st.plag_flagged))}">${st.plag}%</td>`;
         return `<tr>
           <td>${esc(st.fio)}${st.group ? `<br><span class="sub mono">${esc(st.group)}</span>` : ''}</td>
-          <td class="num" style="color:${toneVar(a)}">${st.gost}%</td>
+          <td class="num" style="color:${toneVar(a)}">${gostScore(st.gost)}</td>
           <td class="num" style="color:${toneVar(mt2)}"><b>${g.pct == null ? '–' : g.pct + '%'}</b>
             ${g.score != null ? `<br><span class="sub mono">${g.score} из ${g.scale}</span>` : ''}</td>
           ${plagCell}
@@ -580,6 +657,7 @@
             ? '<span class="code">текст не извлечён – проверить вручную</span> '
             : ''}${st.fails.length
             ? '<span class="sub">не пройдено:</span> ' + st.fails.map(c => `<span class="code">${esc(c)}</span>`).join(' ')
+            : st.gost == null ? '<span class="sub">ГОСТ не проверялся</span>'
             : '<span class="code pass">все критерии пройдены</span>'}</td>
           ${fb}
         </tr>`;
@@ -595,8 +673,8 @@
       const people = groupMatches(s.matches, s.students);
       const matches = people.length ? people.map(p => `
         <div class="fold">
-          <button class="fold-head" type="button" data-mfold="${esc(p.fio)}"
-                  aria-expanded="${matchOpen.has(p.fio)}">
+          <button class="fold-head" type="button" data-mfold="${esc(p.key)}"
+                  aria-expanded="${matchOpen.has(p.key)}">
             <span class="fold-arrow">▸</span>
             <span>${esc(p.fio)}${p.group ? ` <span class="sub mono">${esc(p.group)}</span>` : ''}</span>
             <span class="spacer"></span>
@@ -622,7 +700,7 @@
             <span class="fold-arrow">▸</span>
             <span>Отчёты студентов</span>
             <span class="spacer"></span>
-            <span class="eyebrow">${(s.students || []).length} работ${withIssues ? ` · ${withIssues} с замечаниями` : ' · без замечаний'}</span>
+            <span class="eyebrow">${(s.students || []).length} работ${withIssues ? ` · ${withIssues} с замечаниями` : s.gost == null ? '' : ' · без замечаний'}</span>
           </button>
           <div class="fold-body"><div>
             <div class="tbl-wrap"><table>
@@ -647,7 +725,7 @@
       wireFeedback(s, thr);
     }
 
-    /* Раскрытые ФИО переживают перерисовку: список обновляется каждые две
+    /* Раскрытые работы переживают перерисовку: список обновляется каждые две
        секунды, пока проверка идёт. */
     function wireMatchFolds() {
       $$('#detail-pane [data-mfold]').forEach(b => {
@@ -724,10 +802,7 @@
         body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">#${esc(b.dataset.stop)}</b></p>`,
         okText: 'Прервать', danger: true,
         onOk: async () => {
-          const res = await post(`/jobs/${b.dataset.stop}/cancel`);
-          const data = await res.json().catch(() => ({}));
-          if (res.ok) { toast('Останавливаем проверку…'); load(); }
-          else toast(data.error || 'Не удалось прервать проверку');
+          if (await postAction(`/jobs/${b.dataset.stop}/cancel`)) { toast('Останавливаем проверку…'); load(); }
         },
       });
     }
@@ -741,10 +816,7 @@
         body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">#${esc(b.dataset.del)}</b></p>`,
         okText: 'Удалить', danger: true,
         onOk: async () => {
-          const res = await post(`/jobs/${b.dataset.del}/delete`);
-          const data = await res.json().catch(() => ({}));
-          if (res.ok) { toast('Проверка удалена'); selected = null; load(); }
-          else toast(data.error || 'Не удалось удалить проверку');
+          if (await postAction(`/jobs/${b.dataset.del}/delete`)) { toast('Проверка удалена'); selected = null; load(); }
         },
       });
     }
@@ -758,10 +830,7 @@
       sub: 'Будут удалены только ваши проверки, их отчёты и сохранённые вами отпечатки. Отменить нельзя.',
       okText: 'Очистить мои данные', danger: true,
       onOk: async () => {
-        const res = await post('/jobs/clear');
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) { toast('Ваши история и база очищены'); load(); }
-        else toast(data.error || 'Не удалось очистить');
+        if (await postAction('/jobs/clear')) { toast('Ваши история и база очищены'); load(); }
       },
     });
 
@@ -776,13 +845,9 @@
       okText: 'Удалить всё', danger: true,
       onOk: async () => {
         const input = $('#clear-confirm-login');
-        const res = await post('/jobs/clear/all', {
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ confirm_login: input ? input.value : '' }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) { toast('Данные всех преподавателей удалены'); selected = null; load(); }
-        else toast(data.error || 'Не удалось выполнить глобальную очистку');
+        if (await postAction('/jobs/clear/all', { confirm_login: input ? input.value : '' })) {
+          toast('Данные всех преподавателей удалены'); selected = null; load();
+        }
       },
     });
 
@@ -797,6 +862,7 @@
   function initUpload() {
     const input = $('#file-input');
     const zone = $('#dropzone');
+    const folder = $('#folder-input');
     const fileList = $('#file-list');
     const startBtn = $('#start-btn');
     const thr = $('#threshold');
@@ -812,7 +878,10 @@
     let overLimit = false;
     let locked = false;
 
-    const same = (a, b) => a.name === b.name && a.size === b.size
+    let readingFolders = 0;
+    const droppedPaths = new WeakMap();
+    const filePath = f => droppedPaths.get(f) || f.webkitRelativePath || f.name;
+    const same = (a, b) => filePath(a) === filePath(b) && a.size === b.size
       && a.lastModified === b.lastModified;
 
     const listNames = names => names.slice(0, 3).map(n => `«${n}»`).join(', ')
@@ -840,9 +909,9 @@
       overLimit = !!limitMb && total / 1048576 > limitMb;
       fileList.innerHTML = !picked.length ? '' :
         '<div class="stat-row">' + picked.map((f, i) =>
-          `<span class="stat-chip">${esc(f.name)} · <b>${mb(f.size)} МБ</b>` +
+          `<span class="stat-chip">${esc(filePath(f))} · <b>${mb(f.size)} МБ</b>` +
           `<button type="button" class="chip-x" data-drop="${i}" title="Убрать файл"` +
-          ` aria-label="Убрать ${esc(f.name)}">×</button></span>`).join('') + '</div>' +
+          ` aria-label="Убрать ${esc(filePath(f))}">×</button></span>`).join('') + '</div>' +
         `<p class="hint" style="margin:8px 0 0;">Выбрано файлов: ${picked.length} · ${mb(total)} МБ` +
         (overLimit ? ` – больше допустимых ${limitMb} МБ, уберите лишние` : '') + '</p>';
 
@@ -850,20 +919,62 @@
         b.disabled = locked;
         b.onclick = () => { picked.splice(+b.dataset.drop, 1); showFiles(); };
       });
-      startBtn.disabled = locked || !picked.length || overLimit;
+      startBtn.disabled = locked || readingFolders > 0 || !picked.length || overLimit;
     };
 
-    input.addEventListener('change', () => {
-      addFiles(input.files);
-      // Сброс поля: иначе повторный выбор того же файла не считается
-      // изменением, и вернуть только что убранный файл было бы нечем.
-      input.value = '';
-    });
+    for (const picker of [input, folder]) {
+      picker.addEventListener('change', () => {
+        addFiles(picker.files);
+        picker.value = '';
+      });
+    }
+    const folderButton = $('#choose-folder');
+    folderButton.hidden = !('webkitdirectory' in folder);
+    folderButton.onclick = () => folder.click();
+
+    async function readEntry(entry, files) {
+      if (entry.isFile) {
+        const file = await new Promise((ok, fail) => entry.file(ok, fail));
+        droppedPaths.set(file, entry.fullPath.replace(/^\//, ''));
+        files.push(file);
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        while (true) {
+          const batch = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+          if (!batch.length) break;
+          for (const child of batch) await readEntry(child, files);
+        }
+      }
+    }
+
     ['dragenter', 'dragover'].forEach(ev =>
       zone.addEventListener(ev, e => { e.preventDefault(); if (!locked) zone.classList.add('over'); }));
     ['dragleave', 'drop'].forEach(ev =>
       zone.addEventListener(ev, e => { e.preventDefault(); zone.classList.remove('over'); }));
-    zone.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+    zone.addEventListener('drop', async e => {
+      if (locked) return;
+      // The browser makes the drag data store inaccessible after the event.
+      const items = Array.from(e.dataTransfer.items || []).filter(item => item.kind === 'file');
+      if (!items.length) { addFiles(e.dataTransfer.files); return; }
+      const sources = items.map(item => ({
+        entry: item.webkitGetAsEntry?.(), file: item.getAsFile(),
+      }));
+      readingFolders++;
+      showFiles();
+      try {
+        const files = [];
+        for (const {entry, file} of sources) {
+          if (entry) await readEntry(entry, files);
+          else if (file) files.push(file);
+        }
+        addFiles(files);
+      } catch {
+        toast('Не удалось прочитать папку. Выберите её через «Выбрать папку» или загрузите ZIP.');
+      } finally {
+        readingFolders--;
+        showFiles();
+      }
+    });
 
     if (thr) thr.oninput = () => { $('#thr-val').textContent = thr.value + '%'; };
 
@@ -893,7 +1004,7 @@
        ушли на сервер вместе с файлами, и сдвинутый ползунок или снятая галочка
        на идущую проверку не влияют – а выглядит так, будто влияют. Кнопку
        «Прервать» и показ весов не трогаем: смотреть и останавливать можно. */
-    const LOCKABLE = '#file-input,#threshold,#use-memory,.gost-cb,.w-in,'
+    const LOCKABLE = '#file-input,#folder-input,#choose-folder,#threshold,#use-memory,.gost-cb,.w-in,'
       + '#grade-scale,#gost-all,#gost-none,#w-equal';
 
     const setLocked = on => {
@@ -929,6 +1040,7 @@
       sending = xhr;
       xhr.open('POST', url);
       xhr.setRequestHeader('X-CSRF-Token', CSRF);
+      xhr.setRequestHeader('Accept', 'application/json');
       if (onSent) xhr.upload.onprogress = e => {
         if (e.lengthComputable) onSent(e.loaded);
       };
@@ -939,10 +1051,11 @@
         reject(err);
       };
       xhr.onload = () => {
-        let out = {};
-        try { out = JSON.parse(xhr.responseText); } catch (_) { /* не JSON */ }
-        if (xhr.status >= 400) {
-          const err = new Error(out.error || `Сервер ответил ${xhr.status}`);
+        let out;
+        try { out = JSON.parse(xhr.responseText); } catch { /* Render the response error below. */ }
+        if (xhr.status < 200 || xhr.status >= 300 || !out || typeof out !== 'object') {
+          const err = new Error(out?.error || (xhr.status >= 400 ? `Сервер ответил ${xhr.status}`
+            : 'Сервер не подтвердил загрузку. Обновите страницу и проверьте вход в систему.'));
           err.status = xhr.status;
           reject(err);
         } else resolve(out);
@@ -957,6 +1070,7 @@
        сервере в один каталог, проверка запускается после последнего. */
     const sendFiles = async (files, extra) => {
       const start = await send('/upload/start', new FormData());
+      if (!start.upload_id) throw new Error('Сервер не подтвердил начало загрузки.');
       const chunkSize = start.chunk_size || 16 * 1048576;
       const totalBytes = files.reduce((s, f) => s + f.size, 0);
       let doneBytes = 0;
@@ -981,7 +1095,9 @@
           part.append('offset', String(off));
           part.append('chunk', f.slice(off, off + chunkSize), 'part');
           try {
-            return await send('/upload/part', part, sent => show(sent));
+            const reply = await send('/upload/part', part, sent => show(sent));
+            if (reply.ok !== true) throw new Error('Сервер не подтвердил получение файла.');
+            return;
           } catch (err) {
             // Отказ по сути – не тот файл, нет прав, превышен объём – повторять
             // бессмысленно. Повтор только для обрыва связи и сбоя сервера.
@@ -1026,6 +1142,8 @@
 
     const panel = $('#run-panel');
     const runTitle = $('#run-title');
+    const runHint = $('#run-hint');
+    const uploadHint = runHint.textContent;
     const cancelBtn = $('#run-cancel');
     const openLink = $('#run-open');
     const reportLink = $('#run-report');
@@ -1043,6 +1161,8 @@
        иначе набранная рядом следующая партия пропала бы. */
     const watch = (jobId, redirect) => {
       watched = jobId;
+      runHint.hidden = false;
+      runHint.textContent = 'Страницу можно закрыть. Проверка продолжится на сервере, результат появится в списке проверок.';
       panel.hidden = false;
       cancelBtn.hidden = false;
       openLink.hidden = false;
@@ -1053,6 +1173,7 @@
         watched = null;
         if (redirect) { window.location.href = '/'; return; }
         setLocked(false);
+        runHint.hidden = true;
         cancelBtn.hidden = true;
         runTitle.textContent = j.status === 'done' ? 'Проверка завершена'
           : j.status === 'cancelled' ? 'Проверка прервана' : 'Проверка не выполнена';
@@ -1065,13 +1186,28 @@
 
       const poll = async () => {
         if (watched !== jobId) return;      // за это время запустили следующую
-        let res;
-        try { res = await fetch(`/status/${jobId}`); }
-        catch (e) { setTimeout(poll, 2000); return; }
-        // Проверку удалили из истории – показывать больше нечего.
-        if (res.status === 404) { watched = null; panel.hidden = true; setLocked(false); return; }
-        if (!res.ok) { setTimeout(poll, 2000); return; }
-        const j = await res.json();
+        let j;
+        try {
+          j = await requestJson(`/status/${jobId}`);
+          if (!['processing', 'done', 'cancelled', 'error'].includes(j.status)) {
+            throw new Error('Сервер не вернул статус проверки.');
+          }
+        } catch (err) {
+          if (watched !== jobId) return;
+          if (err.status === 404 || accessDenied(err)) {
+            watched = null;
+            setLocked(false);
+            cancelBtn.hidden = true;
+            runHint.hidden = true;
+            runTitle.textContent = 'Статус проверки недоступен';
+            $('#run-step').textContent = err.status === 404 ? 'Проверка не найдена.' : err.message;
+          } else {
+            $('#run-step').textContent = err.message + ' Повторяем запрос статуса…';
+            setTimeout(poll, 2000);
+          }
+          return;
+        }
+        if (watched !== jobId) return;
         showRun(j);
         if (j.status === 'processing') { setTimeout(poll, 1500); return; }
         finish(j);
@@ -1083,13 +1219,16 @@
        после обновления оставалась пустая форма, и по ней нельзя было понять,
        идёт ли проверка вообще. */
     const restore = async () => {
+      if (locked || watched) return;
       let list;
       try {
-        const res = await fetch('/jobs/active', { headers: { Accept: 'application/json' } });
-        if (!res.ok) return;
-        list = await res.json();
-      } catch (e) { return; }
-      if (!list.length || watched) return;
+        list = await requestJson('/jobs/active');
+      } catch (err) {
+        if (accessDenied(err)) toast(err.message);
+        else setTimeout(restore, 2000);
+        return;
+      }
+      if (!list.length || watched || locked) return;
       showRun(list[0]);
       watch(list[0].job_id, false);
     };
@@ -1105,10 +1244,7 @@
              + 'отпечатки в базу не попадут.',
           okText: 'Прервать проверку', danger: true,
           onOk: async () => {
-            const res = await post(`/jobs/${jobId}/cancel`);
-            const data = await res.json().catch(() => ({}));
-            toast(res.ok ? 'Останавливаем проверку…'
-                         : (data.error || 'Не удалось прервать проверку'));
+            if (await postAction(`/jobs/${jobId}/cancel`)) toast('Останавливаем проверку…');
           },
         });
         return;
@@ -1123,6 +1259,7 @@
 
     uploadForm.addEventListener('submit', async e => {
       e.preventDefault();
+      if (locked || readingFolders) return;
       const files = picked.slice();
       if (!files.length) { toast('Сначала выберите отчёты'); return; }
       if (overLimit) {
@@ -1151,6 +1288,8 @@
         behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
       });
       runTitle.textContent = 'Загрузка файлов';
+      runHint.hidden = false;
+      runHint.textContent = uploadHint;
       cancelBtn.hidden = false;
       openLink.hidden = true;         // уход со страницы оборвал бы передачу
       reportLink.hidden = true;
@@ -1191,13 +1330,9 @@
       body: `<p style="margin:0;font-size:13px;">${esc(btn.dataset.who)}</p>`,
       okText: 'Удалить', danger: true,
       onOk: async () => {
-        const res = await post('/memory/delete', {
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key: btn.dataset.forget }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) { toast('Отпечаток удалён'); btn.closest('tr').remove(); }
-        else toast(data.error || 'Не удалось удалить запись');
+        if (await postAction('/memory/delete', { key: btn.dataset.forget })) {
+          toast('Отпечаток удалён'); btn.closest('tr').remove();
+        }
       },
     });
   });
@@ -1226,8 +1361,8 @@
       lineWrap.innerHTML =
         `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Число проверок по дням">
           ${grid}
-          <text x="${x(0)}" y="${h - 5}" font-size="10" fill="var(--muted)" text-anchor="start">${data[0][0].slice(0, 5)}</text>
-          <text x="${x(last)}" y="${h - 5}" font-size="10" fill="var(--muted)" text-anchor="end">${data[last][0].slice(0, 5)}</text>
+          <text x="${x(0)}" y="${h - 5}" font-size="10" fill="var(--muted)" text-anchor="${last ? 'start' : 'middle'}">${data[0][0].slice(0, 5)}</text>
+          ${last ? `<text x="${x(last)}" y="${h - 5}" font-size="10" fill="var(--muted)" text-anchor="end">${data[last][0].slice(0, 5)}</text>` : ''}
           <path d="${line}L${x(last)},${y(0)}L${x(0)},${y(0)}Z" fill="var(--brand)" opacity=".09"/>
           <path d="${line}" fill="none" stroke="var(--brand)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
           <circle cx="${x(last)}" cy="${y(data[last][1])}" r="3.4" fill="var(--brand)" stroke="var(--surface)" stroke-width="2"/>

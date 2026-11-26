@@ -64,7 +64,7 @@ from checker.gost             import check_gost, GOST_CHECKS, ALL_CODES, FLAW_TE
 from checker.text_plagiarism  import check_text_plagiarism
 from checker.image_plagiarism import check_image_plagiarism
 from checker.reporter         import (REPORT_CSP, generate_html_report,
-                                      has_current_report_controls, pdf_resource_fetcher)
+                                      archived_report_controls, pdf_resource_fetcher)
 
 
 APP_TITLE = branding.APP_TITLE
@@ -356,16 +356,23 @@ def _migrate_legacy_ownership():
             job_store.save(jid, data)
 
 
-GOST_SCHEMA = 4   # bumped whenever the meaning of the check codes changes
+GOST_SCHEMA = 5   # version 5 stores an empty selection explicitly
+
+
+def _default_gost(conf):
+    codes = conf.get('default_gost', ALL_CODES)
+    if not codes and conf.get('gost_schema') != GOST_SCHEMA:
+        return ALL_CODES  # older settings used [] as shorthand for all checks
+    return codes
 
 
 def _migrate_settings():
-    """The check codes were re-cut when the criteria list changed, so a saved
-    default set from the previous schema now selects the wrong checks. Reset it
-    to «все критерии» and let the administrator pick again."""
     conf = accounts.get_settings()
-    if conf.get('gost_schema') != GOST_SCHEMA:
-        accounts.save_settings({'gost_schema': GOST_SCHEMA, 'default_gost': []})
+    version = conf.get('gost_schema')
+    if version != GOST_SCHEMA:
+        # Schema 4 already uses today's criterion codes. Earlier schemas do not.
+        codes = _default_gost(conf) if version == 4 else ALL_CODES
+        accounts.save_settings({'gost_schema': GOST_SCHEMA, 'default_gost': codes})
 
 
 def _purge_temp_dirs(older_than: float = 24 * 3600):
@@ -431,6 +438,8 @@ def _csrf_protect():
     if request.method in SAFE_METHODS:
         return None
     if request.path.startswith('/api/'):
+        if request.routing_exception is not None:
+            return None
         if request.headers.get('X-API-Key'):
             return None
         # With no browser session there is nothing for CSRF to protect; let the
@@ -548,10 +557,14 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if g.user is None:
+            if _wants_json():
+                return jsonify({'error': 'Сессия завершена. Обновите страницу и войдите снова.'}), 401
             # Относительный путь, а не request.url: возврат после входа
             # разрешён только внутрь этого сайта (см. _safe_next).
             return redirect(url_for('login', next=request.full_path.rstrip('?')))
         if g.user.get('must_change') and request.endpoint not in ('change_password', 'logout', 'static'):
+            if _wants_json():
+                return jsonify({'error': 'Обновите страницу и смените пароль для продолжения.'}), 403
             return redirect(url_for('change_password'))
         return f(*args, **kwargs)
     return decorated
@@ -803,8 +816,23 @@ def _public_job(job: dict) -> dict:
     Ключи с подчёркиванием – служебные отметки времени для троттлинга записи,
     наружу они не идут.
     """
-    return {k: v for k, v in job.items()
+    data = {k: v for k, v in job.items()
             if k != 'report_html' and not k.startswith('_')}
+    summary = data.get('summary')
+    if summary and 'groups' not in summary:
+        labels = [summary.get('group'), *(s.get('group') for s in summary.get('students', []))]
+        groups = sorted({g for g in labels if isinstance(g, str) and g and g != '–'})
+        summary = data['summary'] = dict(summary, groups=groups)
+    # Earlier digests recorded zero for a batch with no enabled criteria.
+    # A measured zero has failed checks; preserve it, also when old rows
+    # contain too little information to distinguish the two cases.
+    if summary and summary.get('gost') == 0 and summary.get('students'):
+        rows = summary['students']
+        if all(s.get('error') or (s.get('gost') == 0 and s.get('fails') == [])
+               for s in rows):
+            data['summary'] = dict(summary, gost=None, clean=0,
+                                   students=[dict(s, gost=None) for s in rows])
+    return data
 
 
 def _find_job(job_id: str):
@@ -818,12 +846,12 @@ def _find_job(job_id: str):
         if job is not None:
             return _public_job(job)
     stored = job_store.get(job_id)
-    return stored if stored is None else _mark_if_stale(job_id, stored)
+    return None if stored is None else _public_job(_mark_if_stale(job_id, stored))
 
 
 def _all_jobs(user):
     scope = _scope(user)
-    merged = {jid: _mark_if_stale(jid, data)
+    merged = {jid: _public_job(_mark_if_stale(jid, data))
               for jid, data in job_store.load_all(scope).items()}
     with jobs_lock:
         for jid, j in jobs.items():
@@ -851,7 +879,7 @@ def overview():
 @permission_required('run_checks')
 def new_check():
     conf = accounts.get_settings()
-    enabled = conf.get('default_gost') or ALL_CODES
+    enabled = _default_gost(conf)
     weights = grading.clean_weights(conf.get('gost_weights'))
     return render_template('new.html', page='new', gost_checks=GOST_CHECKS,
                            enabled_codes=enabled,
@@ -983,10 +1011,8 @@ def admin_log():
 def admin_settings():
     if request.method == 'POST':
         form = request.form
-        picked = _parse_enabled_checks(form.get('gost'))
-        accounts.save_settings({
+        settings = {
             'default_threshold':       _int_field(form, 'threshold', 60, 10, 90) / 100,
-            'default_gost':            picked if picked is not None else [],
             'gost_weights':            _parse_weights_form(form),
             'grade_scale':             grading.clean_scale(form.get('grade_scale')),
             'retention_days':          _int_field(form, 'retention_days', 0, 0, 3650),
@@ -995,7 +1021,12 @@ def admin_settings():
             'pw_expire_days':          _int_field(form, 'pw_expire_days', 0, 0, 1095),
             'lock_after_fails':        _int_field(form, 'lock_after_fails', 5, 0, 20),
             'lock_minutes':            _int_field(form, 'lock_minutes', 15, 1, 1440),
-        })
+        }
+        raw_gost = (','.join(form.getlist('gost_item')) if 'gost_item' in form
+                    else form.get('gost'))
+        if raw_gost is not None:
+            settings.update(default_gost=_parse_enabled_checks(raw_gost), gost_schema=GOST_SCHEMA)
+        accounts.save_settings(settings)
         flash('Настройки сохранены')
         return redirect(url_for('admin_settings'))
 
@@ -1017,7 +1048,7 @@ def admin_settings():
     weights = grading.clean_weights(conf.get('gost_weights'))
     return render_template('settings.html', page='settings', conf=conf,
                            gost_checks=GOST_CHECKS,
-                           enabled_codes=conf.get('default_gost') or ALL_CODES,
+                           enabled_codes=_default_gost(conf),
                            weights={c: weights.get(c, grading.DEFAULT_WEIGHT)
                                     for c in ALL_CODES},
                            scale=grading.clean_scale(conf.get('grade_scale')),
@@ -1193,12 +1224,14 @@ def _overview_stats(user) -> dict:
     done = [d for d in records.values() if d.get('status') == 'done']
     summaries = [d['summary'] for d in done if d.get('summary')]
 
-    files = sum(int(d.get('total', 0)) for d in done)
-    gost_values = [s['gost'] for s in summaries if s.get('gost')]
+    files = sum(d.get('done_files', d.get('total', 0) if d.get('status') == 'done' else 0)
+                for d in records.values())
+    gost_values = [s['gost'] for s in summaries if s.get('gost') is not None]
     grade_values = [s['grade'] for s in summaries if s.get('grade') is not None]
-    flagged = sum(len(s.get('matches', [])) for s in summaries)
+    flagged = sum(s['matches_total'] if s.get('matches_total') is not None else len(s.get('matches', []))
+                  for s in summaries)
     clean = sum(s.get('clean', 0) for s in summaries)
-    scored = sum(len(s.get('students', [])) for s in summaries)
+    scored = sum(st.get('gost') is not None for s in summaries for st in s.get('students', []))
 
     fails: dict = {}
     for s in summaries:
@@ -1228,7 +1261,7 @@ def _overview_stats(user) -> dict:
     return {
         'total_checks':   len(records),
         'total_files':    files,
-        'avg_gost':       round(sum(gost_values) / len(gost_values)) if gost_values else 0,
+        'avg_gost':       round(sum(gost_values) / len(gost_values)) if gost_values else None,
         'avg_grade':      (round(sum(grade_values) / len(grade_values))
                            if grade_values else None),
         'flagged':        flagged,
@@ -1237,7 +1270,10 @@ def _overview_stats(user) -> dict:
         'scored':         scored,
         'top_violations': top_violations,
         'series':         series,
-        'recent':         [dict(job_id=jid, **data) for jid, data in recent],
+        'recent':         [dict(data, job_id=jid, has_report=bool(
+                              data.get('status') == 'done' and JOB_ID_RE.fullmatch(jid)
+                              and (REPORTS_DIR / f'{jid}.html').is_file()))
+                           for jid, data in recent],
         'teachers':       len({d.get('owner') for d in records.values() if d.get('owner')}),
     }
 
@@ -1601,7 +1637,8 @@ def _job_report(job_id: str):
     report_path = REPORTS_DIR / f'{job_id}.html'
     if not report_path.exists():
         abort(404)
-    if has_current_report_controls(report_path):
+    supplement = archived_report_controls(report_path)
+    if not supplement:
         response = send_file(report_path.resolve(), mimetype='text/html')
     else:
         # Archived controls may have a different hash. Keep their content visible
@@ -1609,7 +1646,7 @@ def _job_report(job_id: str):
         def expanded_report():
             with report_path.open('rb') as file:
                 yield from iter(lambda: file.read(64 * 1024), b'')
-            yield b'<style>.report-body,.section-body{display:block!important}</style>'
+            yield supplement
 
         response = app.response_class(expanded_report(), mimetype='text/html')
     response.headers['Content-Security-Policy'] = REPORT_CSP
@@ -2549,10 +2586,14 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
 api = Blueprint('api', __name__, url_prefix='/api/v1')
 
 
-@api.errorhandler(HTTPException)
-def api_error(exc):
-    """Always answer the API with JSON, never an HTML error page."""
-    return jsonify({'error': exc.description, 'status': exc.code}), exc.code
+@app.errorhandler(HTTPException)
+def http_error(exc):
+    if request.path != '/api/v1' and not request.path.startswith('/api/v1/'):
+        return exc
+    response = exc.get_response()  # Includes Allow for method errors.
+    response.set_data(app.json.dumps({'error': exc.description, 'status': exc.code}))
+    response.content_type = 'application/json'
+    return response
 
 
 @api.route('/health')

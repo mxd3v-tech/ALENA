@@ -12,10 +12,10 @@ from . import grading
 MAX_MATCHES = 500   # сколько совпадений хранится в дайджесте, см. build()
 
 
-def _gost_pct(report: dict) -> int:
+def _gost_pct(report: dict) -> int | None:
     results = report.get('gost_results', []) or []
     if not results:
-        return 0
+        return None
     passed = sum(1 for c in results if c.get('passed'))
     return round(passed / len(results) * 100)
 
@@ -56,6 +56,8 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
     the criteria.
     """
     by_path = {r.get('path'): r for r in (reports + historical)}
+    # Local identifiers distinguish files and archive versions without exposing storage paths.
+    work_ids = {path: index for index, path in enumerate(by_path, 1)}
     matrix = text_plag.get('matrix', {}) or {}
     no_text = set(text_plag.get('no_text') or ())
     weights = weights or {}
@@ -64,6 +66,8 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
     for r in reports:
         if r.get('error'):
             students.append({
+                'work_id': work_ids[r.get('path')],
+                'filename': r.get('filename', ''),
                 'fio':     _display_name(r),
                 'group':   _group_of(r),
                 'gost':    None,
@@ -86,6 +90,8 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
         # у неё не «0 %», а «неизвестна», иначе скан выглядел бы чистым.
         unreadable = path in no_text
         students.append({
+            'work_id': work_ids[path],
+            'filename': r.get('filename', ''),
             'fio':     _display_name(r),
             'group':   _group_of(r),
             'gost':    _gost_pct(r),
@@ -99,6 +105,20 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
             'error':   None,
         })
 
+    def match_fields(a, b):
+        return {
+            'a':       _display_name(a),
+            'b':       _display_name(b) + (f' · {_group_of(b)}' if _group_of(b) else ''),
+            'a_id':    work_ids[a['path']],
+            'b_id':    work_ids[b['path']],
+            'where':   _where(b),
+            'a_fio':   _display_name(a),
+            'a_group': _group_of(a),
+            'b_fio':   _display_name(b),
+            'b_group': _group_of(b),
+            'b_new':   not b.get('is_historical'),
+        }
+
     matches = []
     for pair in text_plag.get('pairs', []) or []:
         a = by_path.get(pair.get('report1'))
@@ -109,18 +129,9 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
         if a.get('is_historical') and not b.get('is_historical'):
             a, b = b, a
         matches.append({
-            'a':       _display_name(a),
-            'b':       _display_name(b) + (f' · {_group_of(b)}' if _group_of(b) else ''),
-            'pct':     grading.similarity_percent(pair.get('similarity', 0), threshold),
-            'kind':    'текст',
-            'where':   _where(b),
-            # Интерфейс собирает совпадения по работам, а не по парам, поэтому
-            # ему нужны части имени отдельно, а не склеенная строка.
-            'a_fio':   _display_name(a),
-            'a_group': _group_of(a),
-            'b_fio':   _display_name(b),
-            'b_group': _group_of(b),
-            'b_new':   not b.get('is_historical'),
+            **match_fields(a, b),
+            'pct': grading.similarity_percent(pair.get('similarity', 0), threshold),
+            'kind': 'текст',
         })
 
     # Одна и та же пара работ может делить сразу несколько страниц-картинок –
@@ -134,19 +145,21 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
         b = by_path.get(pair.get('report2'))
         if a is None or b is None:
             continue
-        if a.get('is_historical') and not b.get('is_historical'):
+        page_a, page_b = pair.get('page1'), pair.get('page2')
+        # Fresh works come first in work_ids. Canonical order also handles
+        # reversed page pairs from two files within the same batch.
+        if work_ids[a['path']] > work_ids[b['path']]:
             a, b = b, a
-            page = pair.get('page2')
-        else:
-            page = pair.get('page1')
-        key = (a.get('path'), b.get('path'))
-        group = img_groups.setdefault(key, {'a': a, 'b': b, 'pages': []})
-        if page:
-            group['pages'].append(page)
+            page_a, page_b = page_b, page_a
+        key = (a['path'], b['path'])
+        a_pages, b_pages = img_groups.setdefault(key, (set(), set()))
+        if page_a:
+            a_pages.add(page_a)
+        if page_b:
+            b_pages.add(page_b)
 
-    for group in img_groups.values():
-        a, b = group['a'], group['b']
-        pages = sorted(set(group['pages']))
+    for (a_path, b_path), (a_pages, b_pages) in img_groups.items():
+        pages = sorted(a_pages)
         if not pages:
             kind = 'изображение'
         elif len(pages) == 1:
@@ -154,17 +167,11 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
         else:
             kind = 'изображения, стр. ' + ', '.join(str(p) for p in pages)
         matches.append({
-            'a':       _display_name(a),
-            'b':       _display_name(b) + (f' · {_group_of(b)}' if _group_of(b) else ''),
+            **match_fields(by_path[a_path], by_path[b_path]),
             'pct':     None,   # image duplicates are a yes/no match, not a share
             'kind':    kind,
-            'where':   _where(b),
-            'a_fio':   _display_name(a),
-            'a_group': _group_of(a),
-            'b_fio':   _display_name(b),
-            'b_group': _group_of(b),
-            'b_new':   not b.get('is_historical'),
             'pages':   pages,
+            'b_pages': sorted(b_pages),
         })
 
     matches.sort(key=lambda m: (m['pct'] is None, -(m['pct'] or 0)))
@@ -179,17 +186,18 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
     fails = Counter(code for s in students for code in s['fails'])
     # Максимум берётся только по работам, которые вообще удалось сравнить:
     # у остальных заимствование не ноль, а неизвестно.
-    plags = [s['plag'] for s in scored if s['plag'] is not None]
+    plags = [s['plag'] for s in students if s['plag'] is not None]
 
     grades = [s['grade']['pct'] for s in scored
               if s['grade'] and s['grade']['pct'] is not None]
     grade_pct = round(sum(grades) / len(grades)) if grades else None
 
     return {
+        'groups':      groups,
         'group':       groups[0] if groups else '–',
-        'gost':        round(sum(s['gost'] for s in scored) / len(scored)) if scored else 0,
+        'gost':        round(sum(s['gost'] for s in scored) / len(scored)) if scored else None,
         'plag':        max(plags, default=0),
-        'plag_flagged': any(s['plag_flagged'] for s in scored),
+        'plag_flagged': any(s['plag_flagged'] for s in students),
         'no_text':     sum(1 for s in students if s.get('no_text')),
         'threshold':   grading.as_percent(threshold),
         'students':    students,

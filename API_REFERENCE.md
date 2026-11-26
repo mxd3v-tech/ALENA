@@ -2,7 +2,7 @@
 
 A small REST layer for integrating **АЛЁНА** (Автоматический Ловец Ёрничества,
 Небрежности и Аутентичности) – the report checker – into other products.
-Every `/api/v1/*` endpoint returns JSON, including errors.
+API errors return JSON. Successful requests return JSON except for HTML reports and PDF exports.
 
 ## Authentication
 
@@ -97,7 +97,7 @@ Start a check. `multipart/form-data`:
 | `gost` | string | Optional comma-separated GOST check codes to evaluate, e.g. `S1,S3,F7,F9`. Omit the field to run all 22 checks; an empty value runs none. Codes: `S1`-`S9` plus `S5A` (structural elements), `F1`-`F12` (formatting). |
 | `use_memory` | string | Optional. `0`/`false` skips plagiarism comparison against the stored fingerprint base (only files within the batch are compared). New reports are still added to the base. Default `1`. |
 | `weights` | string | Optional per-criterion weight for the recommended grade, `0`-`100` each: `S1:100,F1:20,F2:100`. Codes not listed keep `100`. The weights of the criteria actually selected are normalised to sum to 100. Omit the field to use the weights set by the administrator. |
-| `scale` | int | Optional grade scale, `2`-`100`. `100` (default) means the grade is a percentage; any other value also reports the grade in points of that scale. |
+| `scale` | int | Optional grade scale, `2`-`100`. Omitting it uses the grade scale saved by the administrator (initially `100`). A scale of `100` shows percentages. Other scales also show the grade in points. |
 
 `201 Created`:
 
@@ -148,7 +148,7 @@ List the jobs visible to the caller, keyed by `job_id`:
       "weighted": true,
       "no_text": 1,
       "students": [
-        { "fio": "Петров П. П.", "group": "ПР-21-1", "gost": 61,
+        { "work_id": 1, "fio": "Петров П. П.", "group": "ПР-21-1", "gost": 61,
           "plag": 63, "plag_flagged": true, "no_text": false, "fails": ["S2", "F3", "F7"],
           "flaws": [
             { "code": "S2", "text": "Отсутствует лист задания на практику (курсовую работу)",
@@ -161,7 +161,7 @@ List the jobs visible to the caller, keyed by `job_id`:
           "error": null }
       ],
       "matches": [
-        { "a": "Петров П. П.", "b": "Белов А. Р. · ПР-20-1", "pct": 63,
+        { "a_id": 1, "b_id": 13, "a": "Петров П. П.", "b": "Белов А. Р. · ПР-20-1", "pct": 63,
           "kind": "текст", "where": "база, 18.06.2025" }
       ],
       "matches_total": 7,
@@ -178,12 +178,26 @@ report and no summary. `summary` is `null` until the check finishes;
 `matches[].pct` is `null` for duplicate images, which are a yes/no match rather
 than a share of the text.
 
+`summary.groups` lists all identified groups in the uploaded batch. The older
+`group` field contains the first group in sorted order, or `–` for an ungrouped
+batch. File IDs are local to one job. Each uploaded file has a `students[].work_id` and its
+original `filename`. The fields `a_id` and `b_id` identify the two files in a match. Archive versions also
+receive distinct IDs. For image matches, `pages` contains page numbers in file A
+and `b_pages` contains page numbers in file B. Older summaries can omit the IDs
+and the page numbers for file B. For older jobs the server reconstructs the group
+list from the available student records.
+
 `students[].plag` shows the highest text similarity across the batch and the
 visible archive when archive comparison is enabled. Percentages can be
 fractional. Use `students[].plag_flagged` for the feedback decision. It is true
 when at least one eligible text comparison reached the configured threshold
 before rounding. `summary.plag_flagged` reports the same decision for the whole
 batch. Older summaries can omit these fields.
+
+`students[].gost` is `null` when no GOST criterion was checked for that work.
+`summary.gost` averages the scored works, including zero scores, and is `null`
+when none were scored. `summary.clean` counts works that passed every checked
+criterion and had at least one criterion checked.
 
 `students[].no_text` is `true` when too little text could be extracted from the
 file to compare it with anything – a scan, or a PDF whose fonts carry no usable

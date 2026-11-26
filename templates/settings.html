@@ -76,7 +76,7 @@
           <div style="display:flex;gap:8px;margin-top:12px;">
             <button class="btn sm" type="button" id="w-equal">Сделать равными</button>
           </div>
-          <input type="hidden" name="gost" id="gost-hidden">
+          <input type="hidden" name="gost_item" value="">
         </div>
       </div>
     </div>
@@ -122,8 +122,7 @@
         <div class="section-head"><h2>Доступ по API</h2></div>
         <div class="section-body">
           <p class="hint" style="margin:0;">Ключ <span class="mono">X-API-Key</span> выдаётся конкретной
-            учётной записи в разделе «Пользователи» и работает от её имени: проверки и база остаются
-            в пределах этого преподавателя. Право «Пользоваться API по ключу» должно быть включено.</p>
+            учётной записи в разделе «Пользователи» и работает от её имени: ключу доступны те же проверки и отпечатки, что и владельцу. Право «Пользоваться API по ключу» должно быть включено.</p>
           <div style="margin-top:12px;">
             <a class="btn" href="{{ url_for('admin_users') }}">Перейти к пользователям</a>
           </div>
@@ -133,8 +132,9 @@
       <div class="section">
         <div class="section-head"><h2>Выгрузка базы</h2></div>
         <div class="section-body">
-          <p class="hint" style="margin:0 0 12px;">Выгружаются отпечатки всех преподавателей.
-            Преподаватель выгружает только свою базу – кнопки есть и на странице «База отчётов».</p>
+          <p class="hint" style="margin:0 0 12px;">Выгрузка включает ваши отпечатки и отпечатки коллег
+            из общих групп преподавателей. С правом просмотра всех проверок выгружаются
+            отпечатки всех преподавателей. Те же файлы доступны на странице «База отчётов».</p>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <a class="btn" href="{{ url_for('base_export', format='csv') }}">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v12M7.5 10.5L12 15l4.5-4.5"/><path d="M4 20h16"/></svg>
@@ -203,10 +203,4 @@
   </div>
 </form>
 
-<script>
-  document.querySelector('form[method="post"]').addEventListener('submit', () => {
-    document.getElementById('gost-hidden').value =
-      [...document.querySelectorAll('.gost-def:checked')].map(c => c.value).join(',');
-  });
-</script>
 {% endblock %}

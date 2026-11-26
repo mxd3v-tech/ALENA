@@ -27,8 +27,7 @@
         <a class="btn sm" id="run-open" href="{{ url_for('index') }}" hidden>Ко всем проверкам</a>
         <a class="btn sm primary" id="run-report" href="#" target="_blank" rel="noopener" hidden>Открыть отчёт</a>
       </div>
-      <p class="hint" style="margin:12px 0 0;">Страницу можно закрыть – проверка продолжится
-        на сервере, результат появится в списке проверок.</p>
+      <p class="hint" id="run-hint" style="margin:12px 0 0;">Оставьте страницу открытой до окончания загрузки и запуска проверки.</p>
     </div>
   </div>
 
@@ -42,6 +41,8 @@
             <div class="dz-title">Перетащите отчёты сюда</div>
             <div class="dz-sub">ZIP-архив группы или отдельные работы · PDF, DOCX, ODT, DOC · до {{ upload_max_text }}</div>
           </div>
+          <input type="file" id="folder-input" webkitdirectory multiple hidden>
+          <button class="btn sm" type="button" id="choose-folder" hidden style="margin-top:10px;">Выбрать папку</button>
           <div id="file-list" style="margin-top:12px;"></div>
         </div>
       </div>
@@ -56,9 +57,9 @@
           </div>
           <label class="check" style="margin-top:14px;">
             <input type="checkbox" id="use-memory" checked>
-            <span><b>Сравнивать с моей базой отчётов</b><br>
-              <span class="hint">Ищем совпадения с ранее сданными работами. Ваша база отделена
-                от баз других преподавателей.</span></span>
+            <span><b>Сравнивать с базой отчётов</b><br>
+              <span class="hint">Ищем совпадения с работами, которые ранее проверяли вы
+                и коллеги из ваших групп преподавателей.</span></span>
           </label>
         </div>
       </div>
@@ -139,9 +140,8 @@
   <div class="section" style="margin-top:12px;">
     <div class="section-body">
       <button class="btn primary" type="submit" id="start-btn" disabled>Запустить проверку</button>
-      <span class="hint when-idle" style="margin-left:10px;">Проверка идёт на сервере – страницу можно закрыть.</span>
-      <span class="hint when-busy" style="margin-left:10px;">Поля заперты, пока идёт проверка: партия уже
-        ушла на сервер с заданными параметрами. Чтобы задать другие – прервите проверку.</span>
+      <span class="hint when-idle" style="margin-left:10px;">Оставьте страницу открытой, пока передаются файлы.</span>
+      <span class="hint when-busy" style="margin-left:10px;">Чтобы изменить параметры, прервите загрузку или проверку.</span>
     </div>
   </div>
 </form>

@@ -22,6 +22,7 @@ from pathlib import Path
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from checker import db, jsonstore
+from checker.gost import ALL_CODES
 
 DATA_DIR    = Path(__file__).parent.parent / 'memory'
 USERS_PATH  = DATA_DIR / 'users.json'
@@ -60,7 +61,7 @@ _DEFAULT_PERMS = {
 
 DEFAULT_SETTINGS = {
     'default_threshold':       0.6,
-    'default_gost':            [],      # empty list = all checks
+    'default_gost':            ALL_CODES,
     'gost_weights':            {},      # код критерия → 0…100; нет ключа = 100
     'grade_scale':             100,     # 100 = оценка в процентах, иначе баллы
     'retention_days':          0,       # 0 = keep reports forever

@@ -57,13 +57,13 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
   btn.addEventListener('click', function(e) {
     e.stopPropagation();
     var text = btn.dataset.text || '';
-    var done = function() {
+    var notify = function(ok) {
       var was = btn.textContent;
-      btn.textContent = 'Скопировано';
+      btn.textContent = ok ? 'Скопировано' : 'Не удалось скопировать';
       setTimeout(function() { btn.textContent = was; }, 1600);
     };
     if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text).then(done);
+      navigator.clipboard.writeText(text).then(function() { notify(true); }, function() { notify(false); });
       return;
     }
     var ta = document.createElement('textarea');
@@ -71,9 +71,14 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
     document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); done(); } catch (err) {}
-    document.body.removeChild(ta);
+    try {
+      ta.select();
+      notify(document.execCommand('copy'));
+    } catch (err) {
+      notify(false);
+    } finally {
+      document.body.removeChild(ta);
+    }
   });
 });
 '''
@@ -90,12 +95,22 @@ REPORT_CSP = (
 )
 
 
-def has_current_report_controls(path: Path) -> bool:
-    # Only read the script at the end, even when a report embeds thousands of previews.
+def archived_report_controls(path: Path) -> bytes:
+    """Supply current controls for the previous compatible report layout."""
     footer = f'<script>{_REPORT_SCRIPT}</script>\n</body>\n</html>'.encode()
     with path.open('rb') as file:
         file.seek(max(0, path.stat().st_size - 2 * len(footer)))
-        return file.read().replace(b'\r\n', b'\n').rstrip().endswith(footer)
+        tail = file.read().replace(b'\r\n', b'\n').rstrip()
+    if tail.endswith(footer):
+        return b''
+    # CSP blocks the previous copy handler. Its markup supports the new handler.
+    _, marker, script = tail.rpartition(b'<script>')
+    end = b'</script>\n</body>\n</html>'
+    if marker and script.endswith(end):
+        digest = hashlib.sha256(script[:-len(end)]).hexdigest()
+        if digest == 'af7695412082e7cb77cc8be5d397719aaa715aeccc83aae5949740128046b279':
+            return f'<script>{_REPORT_SCRIPT}</script>'.encode()
+    return b'<style>.report-body,.section-body{display:block!important}</style>'
 
 
 @lru_cache(maxsize=1)
@@ -726,6 +741,8 @@ def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: 
         'no_text': no_text,
         'grade':   mark,
     }
+    if not gost_results:
+        student['gost'] = None
     thr_pct = grading.as_percent(threshold)
     lines = grading.feedback_lines(student, thr_pct)
     plain = grading.feedback_text(student, thr_pct)
@@ -745,6 +762,8 @@ def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: 
     if lines:
         items = ''.join(f'<li>{_esc(l)}</li>' for l in lines)
         body = f'<ul class="flaw-list">{items}</ul>'
+    elif not gost_results:
+        body = '<p>ГОСТ не проверялся.</p>'
     else:
         body = ('<p style="color:var(--success);font-size:var(--text-14);margin:0;">'
                 'Замечаний по оформлению нет.</p>')
@@ -835,7 +854,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
   </div>
 </div>'''
 
-    gost_table = _render_gost_table(gost_results)
+    gost_table = _render_gost_table(gost_results) if total else ''
     text_plag  = _render_text_plag_for_report(
         path, text_plagiarism, threshold, report_by_path, anchors)
     img_plag   = _render_img_plag_for_report(path, image_plagiarism, report_by_path)
@@ -846,7 +865,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
     <span style="font-size:var(--text-16);font-weight:600;flex:1;">{_esc(_display_name(report))}</span>
     {badge}
     <span style="font-size:var(--text-13);color:var(--muted);white-space:nowrap;">
-      ГОСТ: {passed}/{total} &nbsp;|&nbsp; Схожесть: {'–' if no_text else f'{plag_pct}%'}
+      ГОСТ: {f'{passed}/{total}' if total else 'не проверялся'} &nbsp;|&nbsp; Схожесть: {'–' if no_text else f'{plag_pct}%'}
     </span>
     <span class="toggle-arrow">▼</span>
   </div>
@@ -862,11 +881,11 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
       <div>
         <h3>ГОСТ 7.32-2017</h3>
         <div class="score-bar" style="margin-bottom:var(--space-2);">
-          <span style="font-size:var(--text-13);color:var(--muted);width:32px;">{score_pct}%</span>
+          <span style="font-size:var(--text-13);color:var(--muted);width:32px;">{f'{score_pct}%' if total else '–'}</span>
           <div class="score-track">
             <div class="score-fill" style="width:{score_pct}%;background:{score_color};"></div>
           </div>
-          <span style="font-size:var(--text-13);color:var(--muted);">{passed}/{total}</span>
+          <span style="font-size:var(--text-13);color:var(--muted);">{f'{passed}/{total}' if total else 'ГОСТ не проверялся'}</span>
         </div>
         {gost_table}
       </div>

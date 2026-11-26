@@ -80,6 +80,13 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(build([work('/a.pdf', group='ИВТ-201')])['group'],
                          'ИВТ-201')
 
+    def test_all_groups_are_searchable_including_older_compatibility_field(self):
+        digest = build([work('/a.pdf', group='Г2'), work('/b.pdf', group='Г1'),
+                        work('/c.pdf', group='Г2')])
+        self.assertEqual(digest['groups'], ['Г1', 'Г2'])
+        self.assertEqual(digest['group'], 'Г1')
+        self.assertEqual(build([work('/unknown.pdf', group='')])['groups'], [])
+
     def test_a_batch_without_groups_shows_a_dash(self):
         self.assertEqual(build([work('/a.pdf', group='')])['group'], '–')
 
@@ -100,6 +107,17 @@ class DigestTests(unittest.TestCase):
         reports = [work('/a.pdf', gost=criteria(passed=['S1'])),
                    work('/b.pdf', gost=criteria(failed=['S1']))]
         self.assertEqual(build(reports)['clean'], 1)
+
+    def test_disabled_gost_preserves_text_results_and_counts_no_clean_works(self):
+        digest = build([work('/a.pdf'), work('/b.pdf')],
+                       matrix={'/a.pdf': {'/b.pdf': 1.0}, '/b.pdf': {'/a.pdf': 1.0}})
+        self.assertIsNone(digest['gost'])
+        self.assertEqual(digest['clean'], 0)
+        self.assertEqual(digest['plag'], 100)
+        self.assertTrue(digest['plag_flagged'])
+        for row in digest['students']:
+            self.assertIsNone(row['gost'])
+            self.assertIn('ГОСТ не проверялся', grading.feedback_text(row))
 
     def test_failed_criteria_are_counted_across_the_batch(self):
         reports = [work('/a.pdf', gost=criteria(failed=['S1', 'F2'])),
@@ -126,7 +144,7 @@ class DigestTests(unittest.TestCase):
     def test_an_empty_batch_does_not_crash(self):
         digest = build([])
         self.assertEqual(digest['students'], [])
-        self.assertEqual(digest['gost'], 0)
+        self.assertIsNone(digest['gost'])
         self.assertEqual(digest['group'], '–')
 
 
@@ -169,6 +187,32 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]['pages'], [3, 5])
         self.assertEqual(matches[0]['kind'], 'изображения, стр. 3, 5')
+
+    def test_each_side_keeps_its_own_pages_in_either_pair_order(self):
+        a, b = work('/a.pdf'), work('/b.pdf', name='Петров')
+        img_pairs = [{'report1': a['path'], 'report2': b['path'], 'page1': 2, 'page2': 7},
+                     {'report1': b['path'], 'report2': a['path'], 'page1': 8, 'page2': 3}]
+        digest = build([a, b], img_pairs=img_pairs)
+        match, = digest['matches']
+        self.assertEqual((match['pages'], match['b_pages']), ([2, 3], [7, 8]))
+
+        old = dict(b, is_historical=True)
+        match, = build([a], [old], img_pairs=img_pairs)['matches']
+        self.assertFalse(match['b_new'])
+        self.assertEqual((match['pages'], match['b_pages']), ([2, 3], [7, 8]))
+
+    def test_namesakes_and_multiple_files_get_distinct_job_local_ids(self):
+        works = [work('/a.pdf'), work('/b.pdf', group='Г2'), work('/c.pdf')]
+        old = self.historical()
+        pairs = [{'report1': r['path'], 'report2': old['path'], 'similarity': 1}
+                 for r in works]
+        digest = build(works, [old], pairs=pairs)
+        work_ids = [s['work_id'] for s in digest['students']]
+        self.assertEqual(len(set(work_ids)), 3)
+        self.assertEqual([m['a_id'] for m in digest['matches']], work_ids)
+        archive_ids = {m['b_id'] for m in digest['matches']}
+        self.assertEqual(len(archive_ids), 1)
+        self.assertTrue(archive_ids.isdisjoint(work_ids))
 
     def test_a_single_shared_page_names_it(self):
         first, second = work('/a.pdf'), work('/b.pdf', name='Сидоров Сидор')

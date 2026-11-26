@@ -174,7 +174,8 @@ def feedback_text(student: dict, threshold_pct: float = None,
         head += f', {student["group"]}'
 
     if not lines:
-        body = 'Замечаний по оформлению нет.'
+        body = ('ГОСТ не проверялся.' if 'gost' in student and student['gost'] is None
+                else 'Замечаний по оформлению нет.')
     else:
         body = 'Замечания по оформлению:\n' + '\n'.join(bullet + l for l in lines)
 

@@ -74,6 +74,33 @@ class ClearAuthorizationTests(unittest.TestCase):
     def _as(self, user):
         return patch.object(web.accounts, 'get_user', return_value=user)
 
+    def test_polling_after_session_expiry_returns_json_while_navigation_opens_login(self):
+        with self._as(None):
+            for path in ('/jobs', '/jobs/active', '/status/abcdef'):
+                with self.subTest(path=path):
+                    res = self.client.get(path, headers={'Accept': 'application/json'})
+                    self.assertEqual(res.status_code, 401)
+                    self.assertTrue(res.get_json()['error'])
+            self.assertEqual(self.client.get('/new').status_code, 302)
+
+    def test_password_change_required_rejects_ajax_action_and_poll(self):
+        with (self._as(dict(_user(), must_change=True)), patch.object(web, '_memory_delete') as delete):
+            response = self.client.post('/memory/delete', json={'key': 'student'}, headers=self.headers)
+            self.assertEqual(response.status_code, 403)
+            self.assertIn('пароль', response.get_json()['error'])
+            delete.assert_not_called()
+            status = self.client.get('/status/abcdef', headers={'Accept': 'application/json'})
+            self.assertEqual(status.status_code, 403)
+            self.assertIn('пароль', status.get_json()['error'])
+            self.assertEqual(self.client.get('/new').status_code, 302)
+
+    def test_blocked_account_cannot_delete_with_an_open_pages_token(self):
+        with (self._as(dict(_user(), state='blocked')), patch.object(web, '_memory_delete') as delete):
+            response = self.client.post('/memory/delete', json={'key': 'student'}, headers=self.headers)
+            self.assertEqual(response.status_code, 403)
+            self.assertTrue(response.get_json()['error'])
+            delete.assert_not_called()
+
     def test_html_clear_is_always_scoped_to_caller(self):
         user = _user(see_all=True)
         with (self._as(user),
