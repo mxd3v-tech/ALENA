@@ -7,9 +7,8 @@ account allowed to see everything), and that decision needs the record.
 """
 
 import re
-import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from checker import db, jsonstore
@@ -21,7 +20,8 @@ except ImportError:  # Windows local development; production image is Linux.
 
 STORE_PATH = Path(__file__).parent.parent / 'memory' / 'jobs.json'
 STORE_DIR = Path(__file__).parent.parent / 'memory' / 'jobs'
-_lock = threading.Lock()
+REPORTS_DIR = Path(__file__).parent.parent / 'reports'
+_lock = jsonstore.lock
 _ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 # Путь файла проверки → её владелец: см. `_owners_unlocked`. Ключ – путь, а не
 # id: в тестах каталог хранилища подменяется, и одинаковые id из разных
@@ -86,7 +86,7 @@ def _migrate_legacy_unlocked() -> None:
     if remaining:
         jsonstore.write_json(STORE_PATH, remaining)
     else:
-        STORE_PATH.unlink(missing_ok=True)
+        jsonstore.unlink(STORE_PATH, missing_ok=True)
 
 
 def _read_all_unlocked() -> dict:
@@ -99,17 +99,14 @@ def _read_all_unlocked() -> dict:
             data = jsonstore.read_json(path, None)
             if isinstance(data, dict):
                 store[path.stem] = data
-                _owner_cache[str(path)] = data.get('owner', '')
     return store
 
 
 def _owners_unlocked() -> dict:
     """id проверки → её владелец.
 
-    Владелец у проверки не меняется за всю её жизнь, поэтому её файл читается
-    один раз, а дальше сверяется только список имён в каталоге. Это и
-    позволяет показывать число проверок на каждой странице, не разбирая всю
-    историю заново.
+    Владельца читаем повторно, только если файл проверки изменился.
+    Так восстановление из дампа обновляет счётчики и права доступа.
     """
     _migrate_legacy_unlocked()
     owners = {}
@@ -122,13 +119,17 @@ def _owners_unlocked() -> dict:
     if STORE_DIR.exists():
         for path in STORE_DIR.glob('*.json'):
             key = str(path)
-            owner = _owner_cache.get(key)
-            if owner is None:
+            stat = path.stat()
+            stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            cached = _owner_cache.get(key)
+            if cached is None or cached[0] != stamp:
                 data = jsonstore.read_json(path, None)
                 if not isinstance(data, dict):
                     continue
                 owner = data.get('owner', '')
-            fresh[key] = owner
+            else:
+                owner = cached[1]
+            fresh[key] = (stamp, owner)
             owners[path.stem] = owner
     # Удалённые проверки не должны копиться в памяти процесса.
     _owner_cache.clear()
@@ -137,13 +138,14 @@ def _owners_unlocked() -> dict:
 
 
 def save(job_id: str, data: dict) -> None:
+    path = _job_path(job_id)
     if db.DB_ENABLED:
         db.jobs_save(job_id, data)
         return
-    path = _job_path(job_id)
     with _lock, _process_lock():
         _migrate_legacy_unlocked()
         jsonstore.write_json(path, data)
+        _owner_cache.pop(str(path), None)
 
 
 def load_all(owner=None) -> dict:
@@ -171,6 +173,14 @@ def count(owner=None) -> int:
     return sum(1 for value in owners.values() if value == owner)
 
 
+def owners() -> dict:
+    """Current ownership of report files, without loading all job summaries."""
+    if db.DB_ENABLED:
+        return db.job_owners()
+    with _lock, _process_lock():
+        return _owners_unlocked()
+
+
 def get(job_id: str):
     if db.DB_ENABLED:
         return db.jobs_get(job_id)
@@ -195,7 +205,8 @@ def delete(job_id: str) -> bool:
         _migrate_legacy_unlocked()
         if not path.exists():
             return False
-        path.unlink()
+        jsonstore.unlink(path)
+        _owner_cache.pop(str(path), None)
         return True
 
 
@@ -212,7 +223,9 @@ def clear(owner=None) -> list:
                if owner is None or data.get('owner', '') == owner]
         for job_id in ids:
             try:
-                _job_path(job_id).unlink(missing_ok=True)
+                path = _job_path(job_id)
+                jsonstore.unlink(path, missing_ok=True)
+                _owner_cache.pop(str(path), None)
             except ValueError:
                 pass
         legacy = jsonstore.read_json(STORE_PATH, {})
@@ -222,7 +235,7 @@ def clear(owner=None) -> list:
             if legacy:
                 jsonstore.write_json(STORE_PATH, legacy)
             else:
-                STORE_PATH.unlink(missing_ok=True)
+                jsonstore.unlink(STORE_PATH, missing_ok=True)
     return ids
 
 
@@ -237,6 +250,6 @@ def expired(days: int) -> list:
         if created is None:
             continue
         age = now - created
-        if age.days > days:
+        if age > timedelta(days=days):
             stale.append(jid)
     return stale

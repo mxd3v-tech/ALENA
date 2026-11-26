@@ -46,11 +46,11 @@ class JsonStoreTests(unittest.TestCase):
         self.assertEqual(jsonstore.read_json(self.path, {'по': 'умолчанию'}),
                          {'по': 'умолчанию'})
 
-    def test_unreadable_file_gives_the_fallback_instead_of_raising(self):
-        """Оборвавшаяся запись не должна выглядеть как крах приложения."""
+    def test_unreadable_file_is_not_treated_as_an_empty_store(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text('{это не JSON', encoding='utf-8')
-        self.assertEqual(jsonstore.read_json(self.path, {}), {})
+        with self.assertRaises(ValueError):
+            jsonstore.read_json(self.path, {})
 
     def test_cyrillic_is_stored_as_letters_not_escapes(self):
         jsonstore.write_json(self.path, {'группа': 'ИВТ-201'})

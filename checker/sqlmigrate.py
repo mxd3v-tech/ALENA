@@ -1,42 +1,41 @@
-"""Миграция базы: выгрузка всего хранилища в SQL и загрузка дампа обратно.
+"""Portable, non-executable SQL backups for both ALENA storage backends."""
 
-Выгрузка идёт через общий слой хранения, поэтому одинаково работает на
-PostgreSQL и на JSON-файлах: дамп с локальной машины разворачивается на сервере
-с Postgres и наоборот. Файл – обычный SQL, его же можно скормить psql.
-
-Загрузка присланный SQL **не выполняет**. Файл разбирается собственным
-разборщиком, который понимает ровно тот диалект, что пишет dump(): комментарии,
-BEGIN/COMMIT, CREATE/ALTER/DELETE пропускаются, из INSERT-ов берутся значения,
-и записываются они через те же функции хранилища, что и обычная работа
-приложения. Так право «восстановить базу» не превращается в право выполнить
-произвольную команду в СУБД.
-"""
-
+import io
 import json
+import os
 import re
+import sqlite3
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 
-from checker import accounts, db, job_store, memory_store, teams
+from checker import accounts, db, job_store, jsonstore, memory_store, teams
+from checker.text_plagiarism import text_fingerprint
 
 TABLES = ('users', 'jobs', 'fingerprints', 'login_events', 'settings', 'teams')
-
 _JOB_COLS = ('job_id', 'data')
 _FP_COLS = ('entry_key', 'key_base', 'version', 'filename', 'student',
             'normalized_text', 'text_hash', 'image_data', 'pages_count', 'job_id',
             'added_at', 'owner')
 _EVENT_COLS = ('ts', 'login', 'ok', 'ip', 'ua', 'reason')
+_COLUMNS = {'users': db.USER_COLS, 'teams': db.TEAM_COLS, 'jobs': _JOB_COLS,
+            'fingerprints': _FP_COLS, 'login_events': _EVENT_COLS,
+            'settings': ('key', 'value')}
+_ORDER = tuple(_COLUMNS)
 
-LOG_LIMIT = 100000     # журнал входов выгружается целиком, но не бесконечно
+
+def transaction():
+    return (db.transaction() if db.DB_ENABLED
+            else jsonstore.transaction(accounts.USERS_PATH.parent))
 
 
-# ─────────────────────────  Выгрузка  ─────────────────────────
-
-def _quote(s: str) -> str:
-    return "'" + str(s).replace("'", "''") + "'"
+def recover_json():
+    if not db.DB_ENABLED:
+        jsonstore.recover(accounts.USERS_PATH.parent)
 
 
 def _lit(value) -> str:
-    """Значение как литерал PostgreSQL."""
     if value is None:
         return 'NULL'
     if isinstance(value, bool):
@@ -44,339 +43,553 @@ def _lit(value) -> str:
     if isinstance(value, (int, float)):
         return repr(value)
     if isinstance(value, (dict, list)):
-        return _quote(json.dumps(value, ensure_ascii=False)) + '::jsonb'
-    return _quote(value)
-
-
-def _insert(table: str, columns: tuple, values: list) -> str:
-    cols = ', '.join(columns)
-    vals = ', '.join(_lit(v) for v in values)
-    return f'INSERT INTO {table} ({cols}) VALUES ({vals});'
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        return "'" + text.replace("'", "''") + "'::jsonb"
+    return "'" + value.replace("'", "''") + "'"
 
 
 def counts() -> dict:
-    """Сколько чего лежит в хранилище – для страницы миграции."""
-    return {
-        'users':        len(accounts.load_users()),
-        'jobs':         len(job_store.load_all()),
-        'fingerprints': len(memory_store.load_store()),
-        'login_events': len(accounts.recent_logins(LOG_LIMIT)),
-        'teams':        len(teams.load_teams()),
-    }
+    with (db.transaction(snapshot=True) if db.DB_ENABLED else jsonstore.lock):
+        if db.DB_ENABLED:
+            with db._conn() as conn:
+                return {t: conn.execute(f'SELECT count(*) FROM {t}').fetchone()[0]
+                        for t in TABLES if t != 'settings'}
+        return {
+            'users': len(accounts.load_users(include_deleted=True)),
+            'jobs': len(job_store.load_all()),
+            'fingerprints': len(memory_store.load_store()),
+            'login_events': len(accounts.recent_logins(None)),
+            'teams': len(teams.load_teams()),
+        }
+
+
+def _export_rows(table):
+    if table == 'settings':
+        yield {'key': 'app', 'value': accounts.get_settings()}
+        return
+    if db.DB_ENABLED:
+        order = ' ORDER BY id' if table == 'login_events' else ''
+        cols = _COLUMNS[table]
+        with db._conn() as conn, conn.cursor(name='alena_export') as cur:
+            cur.execute(f'SELECT {", ".join(cols)} FROM {table}{order}')
+            for row in cur:
+                yield dict(zip(cols, row))
+        return
+    if table == 'users':
+        yield from accounts.load_users(include_deleted=True).values()
+    elif table == 'teams':
+        yield from teams.load_teams().values()
+    elif table == 'jobs':
+        for key, data in job_store.load_all().items():
+            yield {'job_id': key, 'data': data}
+    elif table == 'fingerprints':
+        for key, data in memory_store.load_store().items():
+            yield dict(data, entry_key=key)
+    elif table == 'login_events':
+        yield from reversed(accounts.recent_logins(None))
+
+
+def write_dump(out):
+    """Write an ordinary SQL file, keeping the same snapshot from start to end."""
+    snapshot = db.transaction(snapshot=True) if db.DB_ENABLED else jsonstore.lock
+    with snapshot:
+        out.write('-- АЛЁНА – дамп базы данных\n')
+        out.write(f'-- Сформирован: {datetime.now():%d.%m.%Y %H:%M}\n')
+        out.write('-- Готовые HTML-отчёты (reports/) переносятся отдельно.\nBEGIN;\n')
+        for stmt in db.SCHEMA:
+            out.write(f'{stmt.strip()};\n')
+        for table in _ORDER:
+            out.write(f'DELETE FROM {table};\n')
+        # Counts verify completeness even if a line disappeared mid-file.
+        numbers = {}
+        for table in _ORDER:
+            cols = _COLUMNS[table]
+            numbers[table] = 0
+            for rec in _export_rows(table):
+                if table == 'users':
+                    rec = accounts.normalize_user(rec)
+                values = ', '.join(_lit(rec.get(c)) for c in cols)
+                out.write(f'INSERT INTO {table} ({", ".join(cols)}) VALUES ({values});\n')
+                numbers[table] += 1
+        out.write('-- ALENA rows ' + json.dumps(numbers) + '\nCOMMIT;\n')
 
 
 def dump() -> str:
-    """Полный дамп хранилища: схема, очистка таблиц и данные."""
-    users  = accounts.load_users()
-    jobs   = job_store.load_all()
-    prints = memory_store.load_store()
-    events = accounts.recent_logins(LOG_LIMIT)
-    conf   = accounts.get_settings()
-    groups = teams.load_teams()
-
-    out = [
-        '-- АЛЁНА – Автоматический Ловец Ёрничества, Небрежности и Аутентичности',
-        '-- Дамп базы данных. #au_team',
-        f'-- Сформирован: {datetime.now().strftime("%d.%m.%Y %H:%M")}',
-        f'-- Источник: {"PostgreSQL" if db.DB_ENABLED else "JSON-файлы в папке memory/"}',
-        f'-- Учётных записей: {len(users)}, проверок: {len(jobs)}, '
-        f'отпечатков: {len(prints)}, записей журнала: {len(events)}, '
-        f'групп преподавателей: {len(groups)}',
-        '--',
-        '-- Готовые HTML-отчёты (папка reports/) в дамп не входят – переносите её',
-        '-- отдельно, иначе кнопка «Открыть отчёт» у старых проверок вернёт 404.',
-        '',
-        'BEGIN;',
-        '',
-        '-- Схема (создаётся, если её ещё нет)',
-    ]
-    out += [f'{stmt.strip()};' for stmt in db.SCHEMA]
-
-    out += [
-        '',
-        '-- Полная замена содержимого. Если дамп нужно дописать к уже имеющимся',
-        '-- данным, удалите эти шесть строк.',
-        'DELETE FROM login_events;',
-        'DELETE FROM jobs;',
-        'DELETE FROM fingerprints;',
-        'DELETE FROM teams;',
-        'DELETE FROM users;',
-        'DELETE FROM settings;',
-        '',
-        f'-- Учётные записи ({len(users)})',
-    ]
-    for user in users.values():
-        out.append(_insert('users', db.USER_COLS,
-                           [user.get(c) for c in db.USER_COLS]))
-
-    out += ['', f'-- Группы преподавателей ({len(groups)})']
-    for team in groups.values():
-        out.append(_insert('teams', db.TEAM_COLS,
-                           [team.get(c) for c in db.TEAM_COLS]))
-
-    out += ['', f'-- История проверок ({len(jobs)})']
-    for job_id, data in jobs.items():
-        out.append(_insert('jobs', _JOB_COLS, [job_id, data]))
-
-    out += ['', f'-- База отпечатков ({len(prints)})']
-    for entry_key, entry in prints.items():
-        values = [entry_key] + [entry.get(c) for c in _FP_COLS[1:]]
-        out.append(_insert('fingerprints', _FP_COLS, values))
-
-    out += ['', f'-- Журнал входов ({len(events)})']
-    for event in reversed(events):        # в БД – от старых к новым
-        out.append(_insert('login_events', _EVENT_COLS,
-                           [event.get(c) for c in _EVENT_COLS]))
-
-    out += [
-        '',
-        '-- Системные настройки',
-        _insert('settings', ('key', 'value'), ['app', conf]),
-        '',
-        'COMMIT;',
-        '',
-    ]
-    return '\n'.join(out)
+    out = io.StringIO()
+    write_dump(out)
+    return out.getvalue()
 
 
-# ─────────────────────────  Разбор дампа  ─────────────────────────
+_INSERT = re.compile(r'INSERT\s+INTO\s+(\w+)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\)',
+                     re.IGNORECASE | re.DOTALL)
+_OLD_COUNTS = re.compile(r'-- Учётных записей: (\d+), проверок: (\d+), отпечатков: (\d+), '
+                         r'записей журнала: (\d+)(?:, групп преподавателей: (\d+))?')
+_TOKEN = re.compile(r"'|--|;")
+_VALUE = re.compile(r"""\s*(?:'([^']*(?:''[^']*)*)'(?:::(jsonb?))?|(NULL|TRUE|FALSE|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?))\s*(,|$)""",
+                    re.IGNORECASE | re.DOTALL)
 
-_INSERT_RE = re.compile(
-    r'^INSERT\s+INTO\s+(\w+)\s*\(([^)]*)\)\s*VALUES\s*\((.*)\)$',
-    re.IGNORECASE | re.DOTALL)
 
-
-def _statements(text: str):
-    """Инструкции SQL из текста: комментарии убраны, строки не разрезаются."""
-    buf, in_str, in_comment, dash = [], False, False, False
-    for ch in text:
-        if in_comment:
-            if ch == '\n':
-                in_comment = False
-                buf.append(ch)
+def _statements(stream, meta):
+    """Consume text or UTF-8 binary lines; retain at most one SQL statement."""
+    if isinstance(stream, str):
+        stream = io.StringIO(stream)
+    buf = io.StringIO()
+    quoted = False
+    for line in stream:
+        if isinstance(line, bytes):
+            line = line.decode('utf-8')
+        if not quoted and line.startswith('--'):
+            if line.startswith('-- ALENA rows '):
+                meta['counts'] = json.loads(line[len('-- ALENA rows '):])
+            elif match := _OLD_COUNTS.fullmatch(line.strip()):
+                names = ('users', 'jobs', 'fingerprints', 'login_events', 'teams')
+                meta['counts'] = {name: int(n) for name, n in zip(names, match.groups())
+                                  if n is not None}
+                meta['legacy_counts'] = True
             continue
-        if in_str:
-            buf.append(ch)
-            if ch == "'":
-                in_str = False
-            continue
-        if ch == "'":
-            in_str = True
-            buf.append(ch)
-            dash = False
-            continue
-        if ch == '-':
-            if dash:
-                buf.pop()          # начало комментария «--»
-                in_comment = True
-                dash = False
+        start = 0
+        for token in _TOKEN.finditer(line):
+            s = token.group()
+            if s == "'":
+                quoted = not quoted
+            elif quoted:
+                continue
+            elif s == '--':
+                buf.write(line[start:token.start()] + '\n')
+                start = len(line)
+                break
             else:
-                buf.append(ch)
-                dash = True
-            continue
-        dash = False
-        if ch == ';':
-            stmt = ''.join(buf).strip()
-            if stmt:
-                yield stmt
-            buf = []
-            continue
-        buf.append(ch)
-    tail = ''.join(buf).strip()
-    if tail:
-        yield tail
+                buf.write(line[start:token.start()])
+                stmt = buf.getvalue().strip()
+                if stmt:
+                    yield stmt
+                buf = io.StringIO()
+                start = token.end()
+        buf.write(line[start:])
+    if quoted or buf.getvalue().strip():
+        raise ValueError('Оборванная инструкция SQL')
 
 
-def _split_values(raw: str) -> list:
-    """Значения одного VALUES(...) – запятые внутри строк и скобок не считаются."""
-    parts, buf, depth, in_str = [], [], 0, False
-    i = 0
-    while i < len(raw):
-        ch = raw[i]
-        if in_str:
-            buf.append(ch)
-            if ch == "'":
-                if i + 1 < len(raw) and raw[i + 1] == "'":
-                    buf.append("'")
-                    i += 1
-                else:
-                    in_str = False
-        elif ch == "'":
-            in_str = True
-            buf.append(ch)
-        elif ch in '([':
-            depth += 1
-            buf.append(ch)
-        elif ch in ')]':
-            depth -= 1
-            buf.append(ch)
-        elif ch == ',' and depth == 0:
-            parts.append(''.join(buf).strip())
-            buf = []
+def _values(raw):
+    pos = 0
+    while pos < len(raw):
+        match = _VALUE.match(raw, pos)
+        if not match:
+            raise ValueError('Недопустимый литерал SQL')
+        string, cast, bare, sep = match.groups()
+        if bare is not None:
+            yield json.loads(bare.lower())
         else:
-            buf.append(ch)
-        i += 1
-    parts.append(''.join(buf).strip())
-    return parts
+            string = string.replace("''", "'")
+            yield json.loads(string) if cast else string
+        pos = match.end()
+        if sep and pos == len(raw):
+            raise ValueError('Пропущено значение SQL')
 
 
-def _value(token: str):
-    """Литерал SQL в значение Python."""
-    text = token.strip()
-    upper = text.upper()
-    if upper == 'NULL':
-        return None
-    if upper == 'TRUE':
-        return True
-    if upper == 'FALSE':
-        return False
-    if text.startswith("'"):
-        end = text.rfind("'")
-        body = text[1:end].replace("''", "'")
-        if text[end + 1:].strip().lower() in ('::jsonb', '::json'):
-            try:
-                return json.loads(body)
-            except ValueError:
-                return body
-        return body
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        return float(text)
-    except ValueError:
-        return text
+def _records(stream, meta):
+    started, committed = False, False
+    clears = set()
+    for stmt in _statements(stream, meta):
+        if committed:
+            raise ValueError('После COMMIT найдены дополнительные инструкции')
+        if stmt.upper() == 'BEGIN':
+            if started:
+                raise ValueError('Повторное начало дампа')
+            started = True
+            continue
+        if stmt.upper() == 'COMMIT':
+            committed = True
+            continue
+        if delete := re.fullmatch(r'DELETE\s+FROM\s+(\w+)', stmt, re.I):
+            clears.add(delete.group(1).lower())
+            continue
+        if stmt.split(None, 1)[0].upper() in ('CREATE', 'ALTER', 'SET'):
+            continue
+        match = _INSERT.fullmatch(stmt)
+        if not match or match[1].lower() not in TABLES:
+            meta['skipped'] += 1
+            continue
+        table = match[1].lower()
+        cols = [c.strip().strip('"') for c in match[2].split(',')]
+        vals = list(_values(match[3]))
+        if len(set(cols)) != len(cols) or len(vals) != len(cols) or set(cols) - set(_COLUMNS[table]):
+            raise ValueError(f'Некорректные столбцы таблицы {table}')
+        yield table, dict(zip(cols, vals))
+    if started and not committed:
+        raise ValueError('Дамп оборван до COMMIT')
+    # Pre-teams exports used five tables and did not count teams in the header.
+    required = set(TABLES)
+    if meta.get('legacy_counts') and 'teams' not in meta['counts']:
+        required.remove('teams')
+    meta['complete'] = started and committed and required <= clears
 
 
-def parse(text: str) -> dict:
-    """Строки из дампа по таблицам. Всё, что не INSERT в известную таблицу,
-    молча пропускается – схема и DELETE нас не интересуют."""
+def parse(text) -> dict:
     rows = {name: [] for name in TABLES}
-    skipped = 0
-    for stmt in _statements(text):
-        match = _INSERT_RE.match(stmt)
-        if match is None:
-            head = stmt.split(None, 1)[0].upper() if stmt.split() else ''
-            if head not in ('BEGIN', 'COMMIT', 'CREATE', 'ALTER', 'DELETE',
-                            'SET', 'TRUNCATE', 'START', 'ROLLBACK', ''):
-                skipped += 1
-            continue
-        table, cols_raw, vals_raw = match.groups()
-        table = table.lower()
-        if table not in rows:
-            skipped += 1
-            continue
-        cols = [c.strip().strip('"') for c in cols_raw.split(',')]
-        values = [_value(v) for v in _split_values(vals_raw)]
-        if len(cols) != len(values):
-            skipped += 1
-            continue
-        rows[table].append(dict(zip(cols, values)))
-    rows['skipped'] = skipped
-    return rows
+    meta = {'skipped': 0}
+    for table, rec in _records(text, meta):
+        rows[table].append(rec)
+    return dict(rows, **meta)
 
 
-# ─────────────────────────  Загрузка  ─────────────────────────
+def _require(condition, context):
+    if not condition:
+        raise ValueError(f'Некорректные данные: {context}')
 
-def restore(rows: dict, replace: bool = False, keep_login: str = '') -> dict:
-    """Записать разобранный дамп в текущее хранилище.
 
-    replace – предварительно очистить проверки, отпечатки и журнал входов и
-    удалить учётные записи, которых в дампе нет. Учётная запись `keep_login`
-    (тот, кто грузит файл) не удаляется никогда, иначе восстановление отрезало
-    бы админа от системы, если дамп снят с другого сервера.
-    """
-    stats = {name: 0 for name in TABLES}
-    stats['deleted_users'] = 0
-    stats['cleared_jobs'] = 0
+def _integer(value):
+    return type(value) is int and value >= 0
 
+
+def _pg_integer(value):
+    return _integer(value) and value <= 2**31 - 1
+
+
+def _strings(values):
+    return isinstance(values, list) and all(isinstance(s, str) for s in values)
+
+
+def _check_summary(summary):
+    for key in ('gost', 'plag', 'grade', 'grade_score', 'threshold', 'scale', 'clean',
+                'matches_total', 'no_text'):
+        value = summary.get(key)
+        _require(value is None or type(value) in (int, float), f'jobs.summary.{key}')
+    if 'clean' in summary:
+        _require(_integer(summary['clean']), 'jobs.summary.clean')
+    fails = summary.get('fail_counts', [])
+    _require(isinstance(fails, list) and all(isinstance(pair, list) and len(pair) == 2
+             and isinstance(pair[0], str) and _integer(pair[1]) for pair in fails),
+             'jobs.summary.fail_counts')
+    for field in ('students', 'matches'):
+        entries = summary.get(field, [])
+        _require(isinstance(entries, list) and all(isinstance(row, dict) for row in entries),
+                 f'jobs.summary.{field}')
+    for student in summary.get('students', []):
+        _require(isinstance(student.get('fio'), str) and _strings(student.get('fails', [])),
+                 'jobs.summary.students')
+        for field in ('gost', 'plag'):
+            _require(student.get(field) is None or _integer(student[field]), f'jobs.students.{field}')
+        grade = student.get('grade')
+        if grade is not None:
+            _require(isinstance(grade, dict) and all(grade.get(k) is None or
+                     type(grade[k]) in (int, float) for k in ('pct', 'score', 'scale')),
+                     'jobs.students.grade')
+            _require(isinstance(grade.get('lost', []), list) and
+                     all(isinstance(row, dict) and type(row.get('weight')) in (int, float)
+                         for row in grade.get('lost', [])), 'jobs.students.grade.lost')
+        flaws = student.get('flaws', [])
+        _require(isinstance(flaws, list) and all(isinstance(row, dict) for row in flaws),
+                 'jobs.students.flaws')
+    for match in summary.get('matches', []):
+        _require(match.get('pct') is None or _integer(match['pct']), 'jobs.matches.pct')
+        _require(isinstance(match.get('pages', []), list) and
+                 all(_integer(n) for n in match.get('pages', [])), 'jobs.matches.pages')
+
+
+def _validate(table, rec):
+    _require(isinstance(rec, dict) and not set(rec) - set(_COLUMNS[table]), table)
+    key = _COLUMNS[table][0]
+    _require(isinstance(rec.get(key), str) and rec[key], f'{table}.{key}')
+    if table == 'jobs':
+        _require(re.fullmatch('[0-9a-f]{6,40}', rec[key]), 'jobs.job_id')
+        job = rec.get('data')
+        _require(isinstance(job, dict) and job.get('status') in
+                 ('done', 'error', 'processing', 'cancelled'), 'jobs.status')
+        for field in ('owner', 'owner_fio', 'step', 'created_at', 'error'):
+            _require(job.get(field) is None or isinstance(job[field], str), f'jobs.{field}')
+        for field in ('progress', 'total', 'done_files', 'text_pairs', 'img_pairs', 'threshold'):
+            _require(field not in job or _integer(job[field]), f'jobs.{field}')
+        _require(job.get('beat') is None or type(job['beat']) in (int, float), 'jobs.beat')
+        _require(job.get('summary') is None or isinstance(job['summary'], dict), 'jobs.summary')
+        if job.get('summary') is not None:
+            _check_summary(job['summary'])
+        _require('job_id' not in job, 'jobs.data.job_id')
+    elif table == 'users':
+        _require(rec.get('role') in ('teacher', 'admin') and
+                 rec.get('state', 'active') in ('active', 'pending', 'blocked', 'deleted'),
+                 'users.role/state')
+        _require(isinstance(rec.get('password_hash'), str) and
+                 (rec['password_hash'] or rec.get('state') == 'deleted'), 'users.password_hash')
+        _require('fio' not in rec or isinstance(rec['fio'], str), 'users.fio')
+        perms = rec.get('perms')
+        _require(perms is None or (isinstance(perms, dict) and
+                                   all(type(v) is bool for v in perms.values())), 'users.perms')
+        _require(rec.get('fail_count') is None or _pg_integer(rec['fail_count']), 'users.fail_count')
+        _require(rec.get('must_change') is None or type(rec['must_change']) is bool, 'users.must_change')
+        for field in set(rec) - {'fail_count', 'perms', 'must_change'}:
+            _require(rec[field] is None or isinstance(rec[field], str), f'users.{field}')
+        if rec.get('account_id'):
+            _require(re.fullmatch('[0-9a-f]{32}', rec['account_id']), 'users.account_id')
+    elif table == 'fingerprints':
+        for field in ('owner', 'filename', 'key_base', 'normalized_text', 'text_hash',
+                      'job_id', 'added_at'):
+            _require(rec.get(field) is None or isinstance(rec[field], str), f'fingerprints.{field}')
+        _require(rec.get('key_base') and _pg_integer(rec.get('version')) and rec['version'] > 0,
+                 'fingerprints.version')
+        _require(rec.get('pages_count') is None or _pg_integer(rec['pages_count']), 'fingerprints.pages_count')
+        if rec.get('owner'):
+            prefix = rec['owner'] + '|'
+            _require(rec[key].startswith(prefix) and rec['key_base'].startswith(prefix),
+                     'владелец отпечатка не совпадает с его ключом')
+        if rec.get('text_hash'):
+            _require(rec['text_hash'] == text_fingerprint(rec.get('normalized_text') or ''),
+                     'fingerprints.text_hash')
+        student = rec.get('student')
+        _require(student is None or (isinstance(student, dict) and
+                                    all(isinstance(student.get(k, ''), str) for k in ('name', 'group'))),
+                 'fingerprints.student')
+        if rec[key] != f"{rec['key_base']}|v{rec['version']}":
+            # Rekeying legacy anonymous submissions kept their public URLs,
+            # including the old shared version number.
+            prefix = (rec.get('owner') or '') + '||'
+            _require(memory_store.student_id(student) == memory_store.NO_STUDENT
+                     and rec['key_base'].startswith(prefix + 'anon:')
+                     and rec[key].startswith(prefix)
+                     and re.search(r'\|v[1-9]\d*$', rec[key]),
+                     'идентификатор отпечатка и его версия не совпадают')
+        _require(rec.get('image_data') is None or isinstance(rec['image_data'], list), 'fingerprints.image_data')
+        for image in rec.get('image_data') or ():
+            _require(isinstance(image, dict) and _integer(image.get('page', 0)) and
+                     type(image.get('is_ui', False)) is bool and _strings(image.get('hashes')) and
+                     all(re.fullmatch('[0-9a-fA-F]{36}', h) for h in image['hashes']) and
+                     (not image.get('thumb') or memory_store.valid_preview(image['thumb'])),
+                     'fingerprints.image_data')
+    elif table == 'teams':
+        _require(isinstance(rec.get('name'), str) and _strings(rec.get('members')), 'teams')
+        _require(rec.get('created_at') is None or isinstance(rec['created_at'], str), 'teams.created_at')
+    elif table == 'login_events':
+        _require(type(rec.get('ok')) is bool, 'login_events.ok')
+        for field in set(rec) - {'ok'}:
+            _require(rec[field] is None or isinstance(rec[field], str), f'login_events.{field}')
+    elif table == 'settings':
+        conf = rec.get('value')
+        _require(rec['key'] == 'app' and isinstance(conf, dict), 'settings')
+        for field, default in accounts.DEFAULT_SETTINGS.items():
+            if field in conf:
+                valid = type(conf[field]) is type(default)
+                if isinstance(default, float):
+                    valid = type(conf[field]) in (int, float) and 0 <= conf[field] <= 1
+                _require(valid, f'settings.{field}')
+        bounds = {'grade_scale': (2, 100), 'retention_days': (0, 3650),
+                  'pw_min_len': (6, 64), 'pw_expire_days': (0, 1095),
+                  'lock_after_fails': (0, 20), 'lock_minutes': (1, 1440)}
+        for field, (lo, hi) in bounds.items():
+            if field in conf:
+                _require(lo <= conf[field] <= hi, f'settings.{field}')
+        _require(_strings(conf.get('default_gost', [])) and
+                 all(_integer(v) and v <= 100 for v in conf.get('gost_weights', {}).values()),
+                 'settings.gost')
+    # PostgreSQL TEXT and JSONB cannot store NUL. Also reject non-finite JSON numbers.
+    data = json.dumps(rec, ensure_ascii=False, allow_nan=False)
+    _require(re.search(r'(?<!\\)(?:\\\\)*\\u0000', data) is None, table)
+    return data
+
+
+class _Staged:
+    """Validated rows on a private temporary SQLite database, replayable by table."""
+    def __init__(self, spool):
+        self.spool = spool
+        spool.execute('CREATE TABLE rows_data (tbl TEXT, ident TEXT, data TEXT, UNIQUE(tbl,ident))')
+        self.counts = dict.fromkeys(TABLES, 0)
+        self.referenced_logins = set()
+
+    def add(self, table, rec):
+        data = _validate(table, rec)
+        ident = None if table == 'login_events' else rec[_COLUMNS[table][0]]
+        try:
+            self.spool.execute('INSERT INTO rows_data VALUES (?,?,?)', (table, ident, data))
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f'Повторяющийся ключ в таблице {table}') from exc
+        self.counts[table] += 1
+        if table == 'jobs':
+            self.referenced_logins.add(rec['data'].get('owner'))
+        elif table == 'fingerprints':
+            self.referenced_logins.add(rec.get('owner'))
+        elif table == 'teams':
+            self.referenced_logins.update(rec['members'])
+        elif table == 'login_events' and rec.get('reason') != 'учётной записи не существует':
+            self.referenced_logins.add(rec.get('login'))
+
+    def rows(self, table):
+        cursor = self.spool.execute('SELECT data FROM rows_data WHERE tbl=? ORDER BY rowid', (table,))
+        return (json.loads(data) for data, in cursor)
+
+    def keys(self, table):
+        return {k for k, in self.spool.execute('SELECT ident FROM rows_data WHERE tbl=?', (table,))}
+
+
+@contextmanager
+def staged_rows(source, replace=False):
+    """Parse and validate before acquiring application locks or changing live data."""
+    if isinstance(source, dict):
+        meta = source
+        records = ((t, rec) for t in TABLES for rec in source.get(t, ()))
+    else:
+        meta = {'skipped': 0}
+        records = _records(source, meta)
+    tmp_root = os.environ.get('AU_TMP_DIR', '').strip() or None
+    if tmp_root:
+        Path(tmp_root).mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='alena_import_', dir=tmp_root) as temp:
+        spool = sqlite3.connect(Path(temp) / 'rows.sqlite')
+        try:
+            stage = _Staged(spool)
+            for table, rec in records:
+                stage.add(table, rec)
+            _require(not meta.get('skipped'), 'в дампе есть неизвестные инструкции')
+            _require(any(stage.counts.values()), 'в дампе нет данных')
+            numbers = meta.get('counts')
+            if numbers is not None:
+                _require(isinstance(numbers, dict) and numbers and
+                         all(t in TABLES and _integer(n) and stage.counts[t] == n
+                             for t, n in numbers.items()), 'не совпадает число строк в дампе')
+                if meta.get('legacy_counts'):
+                    required = set(TABLES) - {'settings', 'teams'}
+                    _require(required <= numbers.keys(), 'неполный заголовок дампа')
+                else:
+                    _require(numbers.keys() == set(TABLES), 'неполный заголовок дампа')
+            stage.complete = bool(meta.get('complete') and numbers
+                                  and stage.counts['settings'] == 1 and stage.counts['users'])
+            if replace:
+                _require(stage.complete, 'для полной замены нужен полный дамп АЛЁНЫ')
+            yield stage
+        finally:
+            spool.close()
+
+
+def restore_file(stream, replace=False, keep_login='', protected_job_ids=()):
+    with staged_rows(stream, replace=replace) as rows:
+        return restore(rows, replace, keep_login, protected_job_ids)
+
+
+def restore(rows, replace=False, keep_login='', protected_job_ids=()):
+    if not isinstance(rows, _Staged):
+        with staged_rows(rows, replace=replace) as stage:
+            return restore(stage, replace, keep_login, protected_job_ids)
+    if replace:
+        _require(rows.complete, 'для полной замены нужен полный дамп АЛЁНЫ')
+    protected = set(protected_job_ids)
+    _require(not (protected and (replace or protected & rows.keys('jobs'))),
+             'дамп затрагивает выполняющуюся проверку')
+    try:
+        with transaction():
+            if db.DB_ENABLED:
+                with db._conn() as conn:
+                    conn.execute('LOCK TABLE users, fingerprints, jobs, teams, settings, login_events '
+                                 'IN SHARE ROW EXCLUSIVE MODE')
+            return _apply(rows, replace, keep_login)
+    finally:
+        if not db.DB_ENABLED:
+            with jsonstore.lock:
+                job_store._owner_cache.clear()
+
+
+def _apply(stage, replace, keep_login):
+    stats = dict(stage.counts, deleted_users=0, cleared_jobs=0)
+    current = accounts.load_users(include_deleted=True)
+    incoming = stage.keys('users')
+    if keep_login:
+        _require(keep_login in current and current[keep_login]['role'] == 'admin',
+                 'учётная запись импортирующего администратора')
+    if stage.complete and not replace:
+        live = {login for login, user in current.items() if user.get('state') != 'deleted'}
+        conflicts = (stage.referenced_logins - incoming) & live
+        if conflicts:
+            raise ValueError('История в дампе относится к отсутствующей учётной записи, '
+                             'а локальный логин уже занят: ' + ', '.join(sorted(conflicts)))
+    # Resolve existing identities before performing any destructive writes.
+    protected_collision = bool(keep_login and replace and keep_login not in incoming)
+    for user in stage.rows('users'):
+        login = user['login']
+        old = current.get(login)
+        if old:
+            aid = user.get('account_id')
+            same = (aid == old.get('account_id') if aid
+                    else old['password_hash'] == user['password_hash'])
+            if login == keep_login:
+                protected_collision = not same
+            elif not replace:
+                _require(same and (old['state'] != 'deleted' or user.get('state') == 'deleted'),
+                         f'логин {login} принадлежит другой учётной записи')
+        elif not replace:
+            _require(not accounts.login_in_history(login), f'логин {login} зарезервирован историей')
+    if protected_collision:
+        _require(keep_login not in stage.referenced_logins,
+                 'логин администратора связан в дампе с другой учётной записью. '
+                 'Войдите под отдельным локальным администратором для переноса')
     if replace:
         memory_store.clear_store(None)
-        for team_id in list(teams.load_teams()):
-            teams.delete_team(team_id)
-        for _ in job_store.clear(None):
-            stats['cleared_jobs'] += 1
-        # Журнал тоже: он не «дописывается» к дампу, а заменяется им – иначе
-        # каждое восстановление удваивало записи. Тот же смысл несёт строка
-        # DELETE FROM login_events в самом дампе, когда его скармливают psql.
+        for key in teams.load_teams():
+            teams.delete_team(key)
+        stats['cleared_jobs'] = len(job_store.clear(None))
         accounts.clear_events()
-        incoming = {r.get('login') for r in rows.get('users', [])}
-        for login in list(accounts.load_users()):
-            if login not in incoming and login != keep_login:
-                accounts.delete_user(login)
-                stats['deleted_users'] += 1
+        remove = current.keys() - incoming - {keep_login}
+        if db.DB_ENABLED:
+            for login in remove:
+                db.users_delete(login)
+        elif remove:
+            jsonstore.write_json(accounts.USERS_PATH, {k: u for k, u in current.items() if k not in remove})
+        stats['deleted_users'] = len(remove)
 
-    for rec in rows.get('users', []):
-        user = {c: rec.get(c) for c in db.USER_COLS}
-        if not user.get('login') or not user.get('password_hash'):
+    for user in stage.rows('users'):
+        login = user['login']
+        if login == keep_login:
+            stats['users'] -= 1
             continue
-        if user.get('perms'):
-            user['perms'] = dict(user['perms'])
-        else:
-            user['perms'] = accounts.default_perms(user.get('role', 'teacher'))
-            # Old dumps had no dedicated global-delete permission. Importing
-            # one must not silently grant a newly introduced destructive right.
+        old = current.get(login)
+        legacy = not user.get('account_id')
+        if old and legacy and old['password_hash'] == user['password_hash']:
+            user = accounts.normalize_user(user)
+            user['account_id'] = old.get('account_id') or user['account_id']
+        if user.get('perms') is None or (not user['perms'] and legacy):
+            user['perms'] = accounts.default_perms(user['role'])
             user['perms']['delete_all'] = False
+        user.setdefault('fio', login)
+        user.setdefault('state', 'active')
         user['must_change'] = bool(user.get('must_change'))
-        user['fail_count'] = int(user.get('fail_count') or 0)
+        user['fail_count'] = user.get('fail_count') or 0
         accounts.save_user(user)
-        stats['users'] += 1
 
-    for rec in rows.get('teams', []):
-        team_id = rec.get('team_id')
-        if not team_id:
-            continue
-        members = rec.get('members')
-        teams.save_team({
-            'team_id':    team_id,
-            'name':       rec.get('name') or team_id,
-            'members':    members if isinstance(members, list) else [],
-            'created_at': rec.get('created_at') or '',
-        })
-        stats['teams'] += 1
-
-    for rec in rows.get('jobs', []):
-        job_id, data = rec.get('job_id'), rec.get('data')
-        if job_id and isinstance(data, dict):
-            job_store.save(job_id, data)
-            stats['jobs'] += 1
+    for team in stage.rows('teams'):
+        teams.save_team(team)
+    for job in stage.rows('jobs'):
+        job_store.save(job['job_id'], job['data'])
 
     store = {}
-    from checker.text_plagiarism import text_fingerprint
-    for rec in rows.get('fingerprints', []):
-        key = rec.get('entry_key')
-        if not key:
-            continue
-        normalized_text = rec.get('normalized_text') or ''
-        store[key] = {
-            'key_base':        rec.get('key_base') or '',
-            'version':         int(rec.get('version') or 1),
-            'filename':        rec.get('filename') or '',
-            'student':         rec.get('student') or {},
-            'normalized_text': normalized_text,
-            'text_hash':       (rec.get('text_hash')
-                                or text_fingerprint(normalized_text)),
-            'image_data':      rec.get('image_data') or [],
-            'pages_count':     int(rec.get('pages_count') or 0),
-            'job_id':          rec.get('job_id') or '',
-            'added_at':        rec.get('added_at') or '',
-            'owner':           rec.get('owner') or '',
-        }
+    for entry in stage.rows('fingerprints'):
+        key = entry.pop('entry_key')
+        for field in ('filename', 'job_id', 'added_at', 'owner'):
+            entry[field] = entry.get(field) or ''
+        entry['pages_count'] = entry.get('pages_count') or 0
+        entry['student'] = entry.get('student') or {}
+        entry['normalized_text'] = entry.get('normalized_text') or ''
+        entry['text_hash'] = entry.get('text_hash') or text_fingerprint(entry['normalized_text'])
+        entry['image_data'] = entry.get('image_data') or []
+        store[key] = entry
+        if db.DB_ENABLED and len(store) >= 100:
+            memory_store.save_store(store)
+            store.clear()
     if store:
         memory_store.save_store(store)
-        stats['fingerprints'] = len(store)
-
-    events = [{c: rec.get(c) for c in _EVENT_COLS}
-              for rec in rows.get('login_events', [])]
+    if stage.counts['fingerprints']:
+        memory_store.migrate_anonymous_versions()
+    events = []
+    for event in stage.rows('login_events'):
+        if db.DB_ENABLED:
+            db.log_add(event)
+        else:
+            events.append(event)
     if events:
         accounts.add_events(events)
-        stats['login_events'] = len(events)
-
-    for rec in rows.get('settings', []):
-        value = rec.get('value')
-        if rec.get('key') == 'app' and isinstance(value, dict):
-            accounts.save_settings(value)
-            stats['settings'] += 1
-
+    if stage.referenced_logins:
+        accounts.reserve_logins({login for login in stage.referenced_logins if login})
+    for rec in stage.rows('settings'):
+        if replace:
+            if db.DB_ENABLED:
+                db.settings_save(rec['value'])
+            else:
+                jsonstore.write_json(accounts.CONF_PATH, rec['value'])
+        else:
+            accounts.save_settings(rec['value'])
     return stats

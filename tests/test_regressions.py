@@ -1,6 +1,9 @@
 import io
+import os
 import tempfile
 import unittest
+from contextlib import nullcontext
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +23,9 @@ from checker.memory_store import NO_STUDENT, student_id
 # app.py performs production startup work at import time. Keep that import away
 # from the real JSON stores and temporary directories used by a running instance.
 _SAFE_TMP = tempfile.TemporaryDirectory()
-with (patch('checker.accounts.bootstrap'),
+with (patch.object(db, 'DB_ENABLED', False),
+      patch.dict(os.environ, {'AU_TMP_DIR': _SAFE_TMP.name}),
+      patch('checker.accounts.bootstrap'),
       patch('checker.accounts.get_settings', return_value={
           'gost_schema': 2,
           'retention_days': 0,
@@ -43,6 +48,7 @@ def _user(login='teacher', role='teacher', **overrides):
     perms.update(overrides)
     return {
         'login': login,
+        'account_id': login + '-test-id',
         'fio': login.title(),
         'role': role,
         'state': 'active',
@@ -59,6 +65,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         self.client = web.app.test_client()
         with self.client.session_transaction() as session:
             session['login'] = 'teacher'
+            session['account_id'] = 'teacher-test-id'
             session['csrf'] = 'test-csrf'
         self.headers = {'X-CSRF-Token': 'test-csrf'}
 
@@ -102,6 +109,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         admin = _user(login='admin', role='admin', see_all=True)
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
+            session['account_id'] = 'admin-test-id'
         with (self._as(admin),
               patch.object(web.job_store, 'clear') as clear_jobs):
             response = self.client.delete(
@@ -116,6 +124,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         admin = _user(login='admin', role='admin', delete_all=True)
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
+            session['account_id'] = 'admin-test-id'
         with (self._as(admin),
               patch.object(web.job_store, 'clear') as clear_jobs):
             response = self.client.delete(
@@ -130,6 +139,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         admin = _user(login='admin', role='admin', delete_all=True)
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
+            session['account_id'] = 'admin-test-id'
         with (self._as(admin),
               patch.object(web.job_store, 'load_all', return_value={}),
               patch.object(web.job_store, 'clear', return_value=[]) as clear_jobs,
@@ -148,6 +158,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         admin = _user(login='admin', role='admin', delete_all=True)
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
+            session['account_id'] = 'admin-test-id'
         with (self._as(admin),
               patch.object(web.job_store, 'load_all', return_value={}),
               patch.object(web.job_store, 'clear', return_value=[]) as clear_jobs,
@@ -244,32 +255,43 @@ class ClearAuthorizationTests(unittest.TestCase):
         with patch.object(web.job_store, 'save', side_effect=save_job):
             web._update('abcdef', _force=True, progress=50)
 
-    def test_full_restore_drops_old_in_memory_jobs(self):
+    def test_sql_restore_invalidates_completed_jobs_in_both_modes(self):
         admin = _user(login='admin', role='admin', delete_all=True)
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
-        with web.jobs_lock:
-            web.jobs['abcdef'] = {'owner': 'admin', 'status': 'done'}
+            session['account_id'] = 'admin-test-id'
         stats = {name: 0 for name in sqlmigrate.TABLES}
         stats['deleted_users'] = 0
         stats['cleared_jobs'] = 0
         with (self._as(admin),
               patch.object(web.job_store, 'load_all', return_value={}),
-              patch.object(web.sqlmigrate, 'parse', return_value={}),
+              patch.object(web.sqlmigrate, 'staged_rows', return_value=nullcontext({})),
+              patch.object(web, '_stage_removed_reports'),
               patch.object(web.sqlmigrate, 'restore', return_value=stats),
               patch.object(web.accounts, 'record_event')):
-            response = self.client.post(
-                '/admin/migration/import',
-                data={
-                    'replace': 'on',
-                    'confirm_login': 'admin',
-                    'dump': (io.BytesIO(b'-- dump'), 'backup.sql'),
-                },
-                headers=self.headers,
-            )
+            for replace in ('', 'on'):
+                with self.subTest(replace=replace):
+                    with web.jobs_lock:
+                        web.jobs['abcdef'] = {'owner': 'admin', 'status': 'done'}
+                    response = self.client.post(
+                        '/admin/migration/import',
+                        data={'replace': replace, 'confirm_login': 'admin',
+                              'dump': (io.BytesIO(b'-- dump'), 'backup.sql')},
+                        headers=self.headers,
+                    )
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(web.jobs, {})
 
+    def test_empty_exported_fingerprint_base_can_be_imported(self):
+        admin = _user(role='admin')
+        content = b'{"count":0,"entries":{}}'
+        with (self._as(admin), patch.object(web.accounts, 'record_event') as record):
+            response = self.client.post('/admin/migration/import', headers=self.headers,
+                                        data={'dump': (io.BytesIO(content), 'base.json')})
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(web.jobs, {})
+        record.assert_called_once()
+        with self.client.session_transaction() as session:
+            self.assertIn('отпечатков: 0', session['_flashes'][-1][1])
 
     def test_explicit_api_key_takes_precedence_over_browser_session(self):
         admin = _user(login='admin', role='admin', delete_all=True, use_api=True)
@@ -298,6 +320,22 @@ class ClearAuthorizationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         clear_jobs.assert_not_called()
 
+    def test_session_cannot_follow_a_login_to_a_different_account(self):
+        with self.client.session_transaction() as session:
+            session['account_id'] = 'former-account'
+        with self._as(_user()):
+            response = self.client.get('/api/v1/jobs')
+        self.assertEqual(response.status_code, 401)
+        with self.client.session_transaction() as session:
+            self.assertNotIn('login', session)
+
+    def test_old_session_without_an_identity_requires_login_again(self):
+        with self.client.session_transaction() as session:
+            session.pop('account_id')
+        with self._as(_user()):
+            response = self.client.get('/api/v1/jobs')
+        self.assertEqual(response.status_code, 401)
+
     def test_missing_api_credentials_return_json_401_before_csrf(self):
         anonymous = web.app.test_client()
 
@@ -309,6 +347,7 @@ class ClearAuthorizationTests(unittest.TestCase):
         admin = _user(login='admin', role='admin')
         with self.client.session_transaction() as session:
             session['login'] = 'admin'
+            session['account_id'] = 'admin-test-id'
         with (self._as(admin),
               patch.object(web.sqlmigrate, 'restore') as restore):
             no_permission = self.client.post(
@@ -350,6 +389,56 @@ class ClearAuthorizationTests(unittest.TestCase):
                 '/jobs/abcdef/cancel', headers=self.headers)
 
         self.assertEqual(response.status_code, 403)
+
+
+class ReportStorageIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.reports = self.root / 'reports'
+        self.reports.mkdir()
+        self.enterContext(patch.object(web, 'REPORTS_DIR', self.reports))
+
+    def test_report_files_follow_the_storage_commit_after_restart(self):
+        old = {'abc123': ['teacher', 'old-id'], 'abcdef': ['teacher', 'old-id']}
+        new = {'abc123': ['teacher', 'new-id']}
+        for recovered in (old, new):
+            with self.subTest(recovered=recovered):
+                for jid in old:
+                    (self.reports / f'{jid}.html').write_text(jid)
+                stage = self.reports / '.alena-restore-test'
+                stage.mkdir()
+                web._stage_removed_reports(stage, old, new, replace=True)
+                self.assertFalse(list(self.reports.glob('*.html')))
+                with patch.object(web, '_report_owners', return_value=recovered):
+                    web._finish_report_cleanup(stage)
+                remaining = {p.stem for p in self.reports.glob('*.html')}
+                self.assertEqual(remaining, set(old) if recovered == old else set())
+                self.assertFalse(stage.exists())
+
+    def test_publication_failure_rolls_back_fingerprints_and_hides_report(self):
+        self.enterContext(patch.object(db, 'DB_ENABLED', False))
+        self.enterContext(patch.object(accounts, 'USERS_PATH', self.root / 'users.json'))
+        self.enterContext(patch.object(memory_store, 'STORE_PATH', self.root / 'store.json'))
+        self.enterContext(patch.dict(web.jobs, {'abc123': {'status': 'processing'}}))
+        work = {'filename': 'report.pdf', 'full_text': 'Исходный текст'}
+        with (patch.object(job_store, 'save', side_effect=OSError('disk full')),
+              self.assertRaises(OSError)):
+            web._publish_job('abc123', 'teacher', '<p>Готово</p>', [work], {'status': 'done'})
+        self.assertFalse(memory_store.load_store())
+        self.assertEqual(web.jobs['abc123']['status'], 'processing')
+        self.assertFalse(list(self.reports.iterdir()))
+
+    def test_newly_imported_job_cannot_claim_a_leftover_html_file(self):
+        orphan = self.reports / 'abcdef.html'
+        orphan.write_text('Старый отчёт')
+        stage = self.reports / '.alena-restore-test'
+        stage.mkdir()
+        owners = {'abcdef': ['teacher', 'new-id']}
+        web._stage_removed_reports(stage, {}, owners, replace=False)
+        self.assertFalse(orphan.exists())
+        with patch.object(web, '_report_owners', return_value=owners):
+            web._finish_report_cleanup(stage)
+        self.assertFalse(orphan.exists())
 
 
 class AnonymousHistoryTests(unittest.TestCase):
@@ -594,6 +683,16 @@ class ReportAnchorTests(unittest.TestCase):
 
 
 class JobDateTests(unittest.TestCase):
+    def test_retention_expires_a_job_one_minute_past_the_limit(self):
+        now = datetime(2026, 2, 1, 12, 0)
+        records = {key: {'created_at': (now - age).strftime('%d.%m.%Y %H:%M')}
+                   for key, age in [('expired', timedelta(days=30, minutes=1)),
+                                    ('keep', timedelta(days=30))]}
+        with (patch.object(job_store, 'datetime', wraps=datetime) as clock,
+              patch.object(job_store, 'load_all', return_value=records)):
+            clock.now.return_value = now
+            self.assertEqual(job_store.expired(30), ['expired'])
+
     def test_parser_returns_real_datetime_or_none(self):
         parsed = job_store.parse_created_at('01.12.2026 08:15')
         self.assertEqual((parsed.year, parsed.month, parsed.day), (2026, 12, 1))
@@ -687,6 +786,7 @@ class ChecksCountTests(unittest.TestCase):
         client = web.app.test_client()
         with client.session_transaction() as session:
             session['login'] = 'teacher'
+            session['account_id'] = 'teacher-test-id'
 
         with (patch.object(web.accounts, 'get_user', return_value=_user()),
               patch.object(web.job_store, 'count', return_value=7) as count,
@@ -706,6 +806,7 @@ class ChecksCountTests(unittest.TestCase):
         client = web.app.test_client()
         with client.session_transaction() as session:
             session['login'] = 'teacher'
+            session['account_id'] = 'teacher-test-id'
 
         with (patch.object(web.accounts, 'get_user', return_value=_user()),
               patch.object(web.job_store, 'count', return_value=0),

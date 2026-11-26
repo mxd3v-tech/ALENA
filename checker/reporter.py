@@ -1,15 +1,101 @@
 """HTML report generation with support for historical (memory) reports."""
 import re
 import base64
+import hashlib
 import html as _html
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 
 from . import branding, grading
+from .memory_store import valid_preview
 
 
 FONTS_DIR = Path(__file__).resolve().parent.parent / 'static' / 'fonts'
+
+
+_THEME_SCRIPT = '''/* Тема ставится до отрисовки, иначе тёмный отчёт мигал бы белым.
+Ключ тот же, что в интерфейсе: отчёт отдаётся с того же домена, и выбор,
+сделанный в топбаре, действует и здесь. */
+(function () {
+  try {
+    var t = localStorage.getItem('alena-theme');
+    if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
+  } catch (e) {}
+})();'''
+
+_REPORT_SCRIPT = '''
+/* Переключатель темы. Выбор пишется в тот же ключ, что и в интерфейсе,
+   поэтому переключение в отчёте переносится на приложение и обратно.
+   Скачанный файл открывают с диска – там свой localStorage, кнопка всё
+   равно работает, просто ни с чем не синхронизируется. */
+(function () {
+  var btn = document.getElementById('theme-btn');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var root = document.documentElement;
+    var dark = root.dataset.theme
+      ? root.dataset.theme === 'dark'
+      : window.matchMedia('(prefers-color-scheme: dark)').matches;
+    root.dataset.theme = dark ? 'light' : 'dark';
+    try { localStorage.setItem('alena-theme', root.dataset.theme); } catch (e) {}
+  });
+})();
+
+document.querySelectorAll('.report-header, .section-head').forEach(function(h) {
+  h.addEventListener('click', function() {
+    var body = this.nextElementSibling;
+    var arrow = this.querySelector('.toggle-arrow');
+    body.classList.toggle('open');
+    if (arrow) arrow.classList.toggle('open');
+  });
+});
+
+/* Копирование отзыва. Кнопка живёт внутри раскрывающейся карточки –
+   клик не должен её сворачивать, поэтому всплытие останавливаем. */
+document.querySelectorAll('.copy-btn').forEach(function(btn) {
+  btn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    var text = btn.dataset.text || '';
+    var done = function() {
+      var was = btn.textContent;
+      btn.textContent = 'Скопировано';
+      setTimeout(function() { btn.textContent = was; }, 1600);
+    };
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(done);
+      return;
+    }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch (err) {}
+    document.body.removeChild(ta);
+  });
+});
+'''
+
+# Only scripts shipped with the renderer may execute on the application's origin.
+_SCRIPT_SOURCES = ' '.join(
+    "'sha256-" + base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() + "'"
+    for script in (_THEME_SCRIPT, _REPORT_SCRIPT)
+)
+REPORT_CSP = (
+    f"default-src 'none'; script-src {_SCRIPT_SOURCES}; script-src-attr 'none'; "
+    "style-src 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; "
+    "form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+)
+
+
+def has_current_report_controls(path: Path) -> bool:
+    # Only read the script at the end, even when a report embeds thousands of previews.
+    footer = f'<script>{_REPORT_SCRIPT}</script>\n</body>\n</html>'.encode()
+    with path.open('rb') as file:
+        file.seek(max(0, path.stat().st_size - 2 * len(footer)))
+        return file.read().replace(b'\r\n', b'\n').rstrip().endswith(footer)
 
 
 @lru_cache(maxsize=1)
@@ -34,6 +120,33 @@ def _font_css() -> str:
     return ("@font-face{font-family:'Manrope';font-style:normal;"
             "font-weight:200 800;font-display:swap;"
             f"src:url(data:font/woff2;base64,{b64}) format('woff2');}}")
+
+
+def pdf_resource_fetcher():
+    """Only read raster thumbnails, logos and fonts embedded in the HTML."""
+    def check(url):
+        if (len(url) > 1024 * 1024 or not url.startswith((
+                'data:image/jpeg;base64,', 'data:image/png;base64,',
+                'data:font/woff2;base64,'))):
+            raise ValueError('PDF-отчёт поддерживает только встроенные ресурсы')
+
+    try:
+        from weasyprint.urls import URLFetcher
+    except ImportError:  # WeasyPrint versions with the callable/dict API
+        from weasyprint import default_url_fetcher
+
+        def fetch(url):
+            check(url)
+            return default_url_fetcher(url)
+
+        return fetch
+
+    class EmbeddedFetcher(URLFetcher):
+        def fetch(self, url, headers=None):
+            check(url)
+            return super().fetch(url, headers)
+
+    return EmbeddedFetcher(allowed_protocols=('data',))
 
 
 def _esc(s: str) -> str:
@@ -338,25 +451,25 @@ def _render_image_summary(image_plagiarism: dict, report_by_path: dict) -> str:
         # src экранируется: превью приходит и из базы отпечатков, а та могла
         # быть залита чужим SQL-дампом – своей строке base64 экранирование не
         # мешает, а подставленной кавычке закрывает дорогу.
-        img1_html = (f'<img src="{_esc(p["img1"])}" alt="img1">' if p.get('img1')
+        img1_html = (f'<img src="{_esc(p["img1"])}" alt="img1">' if valid_preview(p.get('img1'))
                      else '<div class="img-blank">нет превью</div>')
-        img2_html = (f'<img src="{_esc(p["img2"])}" alt="img2">' if p.get('img2')
+        img2_html = (f'<img src="{_esc(p["img2"])}" alt="img2">' if valid_preview(p.get('img2'))
                      else '<div class="img-blank">нет превью</div>')
 
         items.append(f'''
 <div class="img-pair">
   <div>
     {img1_html}
-    <div class="img-info">{n1_html}<br>стр. {p["page1"]}</div>
+    <div class="img-info">{n1_html}<br>стр. {_esc(p["page1"])}</div>
   </div>
   <div style="align-self:center;font-size:var(--text-24);color:var(--danger);">≈</div>
   <div>
     {img2_html}
-    <div class="img-info">{n2_html}<br>стр. {p["page2"]}</div>
+    <div class="img-info">{n2_html}<br>стр. {_esc(p["page2"])}</div>
   </div>
   <div class="img-info" style="align-self:center;">
     {match_badge}<br>
-    <span style="color:var(--muted-soft);font-size:var(--text-12);">расст. {p["distance"]}/144</span>
+    <span style="color:var(--muted-soft);font-size:var(--text-12);">расст. {_esc(p["distance"])}/144</span>
   </div>
 </div>''')
 
@@ -471,7 +584,7 @@ def _render_text_plag_for_report(path: str, text_plagiarism: dict, threshold: fl
             ref_html  = (
                 f'{other_name} '
                 f'<span style="font-size:var(--text-13);">'
-                f'(база v{hist_ver}, {hist_date})</span>'
+                f'(база v{_esc(hist_ver)}, {_esc(hist_date)})</span>'
             )
             alert_cls = ' hist'
         else:
@@ -540,17 +653,22 @@ def _render_img_plag_for_report(path: str, image_plagiarism: dict,
                 f'{other_name} '
                 f'<span class="badge badge-amber">'
                 f'база v{_esc(v)}{f", {_esc(d)}" if d else ""}</span>'
-                f'<br>стр.{other_page}'
+                f'<br>стр.{_esc(other_page)}'
             )
         else:
-            other_label = f'{other_name}, стр.{other_page}'
+            other_label = f'{other_name}, стр.{_esc(other_page)}'
 
         other_img_html = (
             f'<img src="{_esc(other_img)}" alt="other" style="max-height:100px;">'
-            if other_img else
+            if valid_preview(other_img) else
             '<div class="img-blank" style="width:100px;height:70px;">нет превью</div>'
         )
 
+        my_img_html = (
+            f'<img src="{_esc(my_img)}" alt="my" style="max-height:100px;">'
+            if valid_preview(my_img) else
+            '<div class="img-blank" style="width:100px;height:70px;">нет превью</div>'
+        )
         review_badge = ''
         if p.get('ui_review'):
             review_badge = (
@@ -561,8 +679,8 @@ def _render_img_plag_for_report(path: str, image_plagiarism: dict,
 
         items.append(
             f'<div class="img-pair" style="margin:var(--space-2) 0;">'
-            f'<div><img src="{_esc(my_img)}" alt="my" style="max-height:100px;">'
-            f'<div class="img-info">Эта работа, стр.{my_page}</div></div>'
+            f'<div>{my_img_html}'
+            f'<div class="img-info">Эта работа, стр.{_esc(my_page)}</div></div>'
             f'<div style="align-self:center;color:var(--danger);font-size:var(--text-20);">≈</div>'
             f'<div>{other_img_html}'
             f'<div class="img-info">{other_label}</div></div>'
@@ -870,7 +988,7 @@ def generate_html_report(reports: list, historical: list,
             d = other_rep.get('historical_date', '')
             other_name_html = (
                 f'{_esc(_display_name(other_rep))} '
-                f'<span style="color:var(--attention);font-size:var(--text-12);">(база v{v}, {d})</span>'
+                f'<span style="color:var(--attention);font-size:var(--text-12);">(база v{_esc(v)}, {_esc(d)})</span>'
             )
         elif other_rep:
             anc = _anchor(other_rep, anchors)
@@ -963,7 +1081,7 @@ def generate_html_report(reports: list, historical: list,
 
 
     if job_id:
-        dl_btn = f'<a href="/export/{job_id}" class="print-btn">&#11015; Скачать PDF</a>'
+        dl_btn = f'<a href="/export/{_esc(job_id)}" class="print-btn">&#11015; Скачать PDF</a>'
     else:
         dl_btn = ''
 
@@ -1467,75 +1585,13 @@ a:focus-visible { border-radius: 2px; }
 @media print { .copy-btn { display: none; } }
 ''' + logo_css
 
-    js = '''
-/* Переключатель темы. Выбор пишется в тот же ключ, что и в интерфейсе,
-   поэтому переключение в отчёте переносится на приложение и обратно.
-   Скачанный файл открывают с диска – там свой localStorage, кнопка всё
-   равно работает, просто ни с чем не синхронизируется. */
-(function () {
-  var btn = document.getElementById('theme-btn');
-  if (!btn) return;
-  btn.addEventListener('click', function () {
-    var root = document.documentElement;
-    var dark = root.dataset.theme
-      ? root.dataset.theme === 'dark'
-      : window.matchMedia('(prefers-color-scheme: dark)').matches;
-    root.dataset.theme = dark ? 'light' : 'dark';
-    try { localStorage.setItem('alena-theme', root.dataset.theme); } catch (e) {}
-  });
-})();
-
-document.querySelectorAll('.report-header, .section-head').forEach(function(h) {
-  h.addEventListener('click', function() {
-    var body = this.nextElementSibling;
-    var arrow = this.querySelector('.toggle-arrow');
-    body.classList.toggle('open');
-    if (arrow) arrow.classList.toggle('open');
-  });
-});
-
-/* Копирование отзыва. Кнопка живёт внутри раскрывающейся карточки –
-   клик не должен её сворачивать, поэтому всплытие останавливаем. */
-document.querySelectorAll('.copy-btn').forEach(function(btn) {
-  btn.addEventListener('click', function(e) {
-    e.stopPropagation();
-    var text = btn.dataset.text || '';
-    var done = function() {
-      var was = btn.textContent;
-      btn.textContent = 'Скопировано';
-      setTimeout(function() { btn.textContent = was; }, 1600);
-    };
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text).then(done);
-      return;
-    }
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); done(); } catch (err) {}
-    document.body.removeChild(ta);
-  });
-});
-'''
-
     return f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_esc(page_title)}</title>
-<script>/* Тема ставится до отрисовки, иначе тёмный отчёт мигал бы белым.
-Ключ тот же, что в интерфейсе: отчёт отдаётся с того же домена, и выбор,
-сделанный в топбаре, действует и здесь. */
-(function () {{
-  try {{
-    var t = localStorage.getItem('alena-theme');
-    if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t;
-  }} catch (e) {{}}
-}})();</script>
+<script>{_THEME_SCRIPT}</script>
 <style>{css}</style>
 </head>
 <body>
@@ -1621,6 +1677,6 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
 </div>
 
 </div>
-<script>{js}</script>
+<script>{_REPORT_SCRIPT}</script>
 </body>
 </html>'''

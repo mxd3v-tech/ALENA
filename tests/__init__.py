@@ -31,3 +31,4 @@ memory_store.STORE_PATH = DATA_DIR / 'store.json'
 teams.STORE_PATH        = DATA_DIR / 'teams.json'
 job_store.STORE_PATH    = DATA_DIR / 'jobs.json'
 job_store.STORE_DIR     = DATA_DIR / 'jobs'   # рядом с ним лежит и jobs.lock
+job_store.REPORTS_DIR   = DATA_DIR / 'reports'

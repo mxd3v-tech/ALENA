@@ -45,7 +45,7 @@ from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from flask import (Flask, Blueprint, request, jsonify, render_template,
+from flask import (Flask, Blueprint, Request, request, jsonify, render_template,
                    send_file, abort, send_from_directory, session,
                    redirect, url_for, g, flash)
 from werkzeug.exceptions import HTTPException
@@ -63,7 +63,8 @@ from checker.extractor        import extract_report
 from checker.gost             import check_gost, GOST_CHECKS, ALL_CODES, FLAW_TEXT
 from checker.text_plagiarism  import check_text_plagiarism
 from checker.image_plagiarism import check_image_plagiarism
-from checker.reporter         import generate_html_report
+from checker.reporter         import (REPORT_CSP, generate_html_report,
+                                      has_current_report_controls, pdf_resource_fetcher)
 
 
 APP_TITLE = branding.APP_TITLE
@@ -85,8 +86,30 @@ def _trusted_proxy_count() -> int:
     return count
 
 
+class _AppRequest(Request):
+    def _admin_import(self):
+        user = getattr(g, 'user', None)
+        return (self.endpoint == 'migration_import' and user
+                and user.get('role') == 'admin' and not user.get('must_change'))
+
+    @property
+    def max_content_length(self):
+        # A backup can outgrow the size of a single job upload.
+        if self._admin_import():
+            return None
+        return super().max_content_length
+
+    def _get_file_stream(self, total_content_length, content_type,
+                         filename=None, content_length=None):
+        if self._admin_import():
+            return tempfile.TemporaryFile(mode='w+b', dir=TMP_ROOT)
+        return super()._get_file_stream(total_content_length, content_type,
+                                        filename, content_length)
+
+
 TRUSTED_PROXY_COUNT = _trusted_proxy_count()
 app = Flask(__name__)
+app.request_class = _AppRequest
 app.wsgi_app = ProxyFix(
     app.wsgi_app,
     x_for=TRUSTED_PROXY_COUNT,
@@ -121,7 +144,7 @@ app.config.update(
     MAX_FORM_MEMORY_SIZE=2 * 1024 * 1024,
 )
 
-REPORTS_DIR = Path(__file__).parent / 'reports'
+REPORTS_DIR = job_store.REPORTS_DIR
 REPORTS_DIR.mkdir(exist_ok=True)
 
 JOB_ID_RE = re.compile(r'^[0-9a-f]{6,40}$')     # id проверки – только hex
@@ -296,7 +319,8 @@ def _purge_expired():
         days = int(accounts.get_settings().get('retention_days', 0))
         for jid in job_store.expired(days):
             job_store.delete(jid)
-            (REPORTS_DIR / f'{jid}.html').unlink(missing_ok=True)
+            if JOB_ID_RE.fullmatch(jid):
+                (REPORTS_DIR / f'{jid}.html').unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -363,15 +387,18 @@ def _purge_temp_dirs(older_than: float = 24 * 3600):
 
 
 def _startup():
+    from checker.memory_store import migrate_anonymous_versions
+    sqlmigrate.recover_json()
     accounts.bootstrap()
+    for directory in REPORTS_DIR.glob('.alena-restore-*'):
+        if directory.is_dir() and not directory.is_symlink():
+            _finish_report_cleanup(directory)
     _migrate_settings()
     _migrate_legacy_ownership()
+    migrate_anonymous_versions()
     _recover_stale_jobs()
     _purge_expired()
     _purge_temp_dirs()
-
-
-_startup()
 
 
 # ─────────────────────────  Защита запросов  ─────────────────────────
@@ -395,7 +422,6 @@ def _csrf_ok() -> bool:
     return bool(sent and stored and secrets.compare_digest(sent, stored))
 
 
-@app.before_request
 def _csrf_protect():
     """Меняющий данные запрос принимается только со своим токеном.
 
@@ -504,9 +530,14 @@ def _float_field(form, name: str, default: float, low: float, high: float) -> fl
 @app.before_request
 def _load_user():
     g.user = accounts.get_user(session.get('login', ''))
-    if g.user is not None and g.user.get('state') == 'blocked':
+    if session.get('login') and (g.user is None or g.user['state'] == 'blocked'
+                                 or not session.get('account_id')
+                                 or session['account_id'] != g.user.get('account_id')):
         session.clear()
         g.user = None
+
+
+app.before_request(_csrf_protect)
 
 
 def _client_ip() -> str:
@@ -585,6 +616,7 @@ def login():
         if user is not None:
             session.clear()
             session['login'] = user['login']
+            session['account_id'] = user['account_id']
             session.permanent = True
             if user.get('must_change'):
                 return redirect(url_for('change_password'))
@@ -608,17 +640,20 @@ def change_password():
         current = request.form.get('current', '')
         fresh   = request.form.get('password', '')
         repeat  = request.form.get('repeat', '')
-        from werkzeug.security import check_password_hash
-        if not check_password_hash(g.user['password_hash'], current):
-            error = 'Текущий пароль введён неверно'
-        elif fresh != repeat:
+        if fresh != repeat:
             error = 'Новый пароль и повтор не совпадают'
         else:
             error = accounts.password_problem(fresh)
         if not error:
-            accounts.set_password(g.user['login'], fresh, must_change=False)
-            flash('Пароль изменён')
-            return redirect(url_for('index'))
+            try:
+                changed = accounts.set_password(g.user['login'], fresh, current=current)
+            except ValueError as exc:
+                error = str(exc)
+            else:
+                if changed:
+                    flash('Пароль изменён')
+                    return redirect(url_for('index'))
+                error = 'Текущий пароль введён неверно'
     return render_template('password.html', error=error,
                            forced=bool(g.user.get('must_change')))
 
@@ -776,7 +811,7 @@ def _find_job(job_id: str):
     """Live in-memory state if the job is running, else the stored record."""
     # id проверки уходит в имя файла отчёта – принимаем только тот вид, в
     # котором сами его выдаём, чтобы «../» из адреса никуда не привёл.
-    if not JOB_ID_RE.match(job_id or ''):
+    if not JOB_ID_RE.fullmatch(job_id or ''):
         return None
     with jobs_lock:
         job = jobs.get(job_id)
@@ -1002,13 +1037,99 @@ def admin_migration():
 @admin_required
 def migration_export():
     """Весь состав базы одним файлом .sql – схема, данные, порядок вставки."""
-    payload = sqlmigrate.dump().encode('utf-8')
-    stamp = datetime.now().strftime('%d.%m.%Y')
-    accounts.record_event(g.user['login'], True, _client_ip(),
-                          request.headers.get('User-Agent', ''),
-                          'выгрузка базы в SQL')
-    return send_file(io.BytesIO(payload), mimetype='application/sql',
-                     as_attachment=True, download_name=f'alena-db-{stamp}.sql')
+    output = tempfile.TemporaryFile(mode='w+b', dir=TMP_ROOT)
+    try:
+        writer = io.TextIOWrapper(output, encoding='utf-8', newline='\n')
+        try:
+            sqlmigrate.write_dump(writer)
+        finally:
+            writer.detach()
+        output.seek(0)
+        stamp = datetime.now().strftime('%d.%m.%Y')
+        accounts.record_event(g.user['login'], True, _client_ip(),
+                              request.headers.get('User-Agent', ''),
+                              'выгрузка базы в SQL')
+        # The WSGI file wrapper closes the temporary file after the download.
+        return send_file(output, mimetype='application/sql', as_attachment=True,
+                         download_name=f'alena-db-{stamp}.sql')
+    except BaseException:
+        output.close()
+        raise
+
+
+def _fingerprint_rows(stream):
+    """Read the envelope written by /base/export?format=json."""
+    payload = json.load(stream)
+    if not isinstance(payload, dict) or not isinstance(payload.get('entries'), dict):
+        raise ValueError('Ожидается JSON, выгруженный со страницы базы отпечатков')
+    entries = payload['entries']
+    if type(payload.get('count')) is not int or payload['count'] != len(entries):
+        raise ValueError('Количество отпечатков расходится с заголовком выгрузки')
+    rows = []
+    for key, entry in entries.items():
+        if not key or not isinstance(entry, dict):
+            raise ValueError('Некорректная запись в выгрузке отпечатков')
+        rows.append(dict(entry, entry_key=key))
+    return {'fingerprints': rows}
+
+
+def _report_owners():
+    users = accounts.load_users(include_deleted=True)
+    return {jid: [owner, users.get(owner, {}).get('account_id')]
+            for jid, owner in job_store.owners().items()}
+
+
+def _stage_removed_reports(directory, previous, current, replace):
+    # Move files on the same filesystem. Until the storage commit, they can
+    # all be put back even if a later file operation fails.
+    removed = {}
+    for report in REPORTS_DIR.glob('*.html'):
+        jid = report.stem
+        if not JOB_ID_RE.fullmatch(jid):
+            continue
+        if ((replace and jid not in current) or
+                (jid in current and previous.get(jid) != current[jid])):
+            removed[jid] = previous.get(jid)
+    if removed:
+        (directory / 'owners.json').write_text(json.dumps(removed), encoding='utf-8')
+        for jid in removed:
+            name = f'{jid}.html'
+            (REPORTS_DIR / name).replace(directory / name)
+
+
+def _finish_report_cleanup(directory, *, rollback=False):
+    # After a process restart the current database identifies which side of
+    # the storage commit won. Only files still owned by their original
+    # account can return to the served directory.
+    manifest = directory / 'owners.json'
+    staged = list(directory.glob('*.html'))
+    if staged:
+        previous = json.loads(manifest.read_text(encoding='utf-8'))
+        current = {} if rollback else _report_owners()
+        for report in staged:
+            jid = report.stem
+            if not JOB_ID_RE.fullmatch(jid):
+                raise ValueError('Неверное имя резервного файла отчёта')
+            if rollback or (jid in current and previous.get(jid) == current[jid]):
+                report.replace(REPORTS_DIR / report.name)
+    shutil.rmtree(directory)
+
+
+def _restore_database(rows, replace, active):
+    directory = Path(tempfile.mkdtemp(prefix='.alena-restore-', dir=REPORTS_DIR))
+    try:
+        with sqlmigrate.transaction():
+            previous = _report_owners()
+            stats = sqlmigrate.restore(rows, replace=replace, protected_job_ids=active,
+                                       keep_login=g.user['login'])
+            _stage_removed_reports(directory, previous, _report_owners(), replace)
+    except BaseException:
+        _finish_report_cleanup(directory, rollback=True)
+        raise
+    # The files are already outside the served directory. If removal fails,
+    # startup will finish collecting them using the ownership manifest.
+    shutil.rmtree(directory, ignore_errors=True)
+    return stats
 
 
 @app.route('/admin/migration/import', methods=['POST'])
@@ -1027,50 +1148,42 @@ def migration_import():
             return redirect(url_for('admin_migration'))
     upload = request.files.get('dump')
     if upload is None or not upload.filename:
-        flash('Выберите файл .sql')
+        flash('Выберите SQL-дамп или JSON с отпечатками')
         return redirect(url_for('admin_migration'))
-    if not upload.filename.lower().endswith('.sql'):
-        flash('Ожидается файл с расширением .sql')
+    ext = Path(upload.filename).suffix.lower()
+    if ext not in ('.sql', '.json'):
+        flash('Выберите SQL-дамп или JSON с отпечатками')
         return redirect(url_for('admin_migration'))
-
-    try:
-        text = upload.read().decode('utf-8')
-    except UnicodeDecodeError:
-        flash('Файл не в кодировке UTF-8 – это не наш дамп')
+    if ext == '.json' and replace:
+        flash('JSON содержит только отпечатки. Для полной замены нужен SQL-дамп.')
         return redirect(url_for('admin_migration'))
 
     try:
-        rows = sqlmigrate.parse(text)
-        if replace:
-            # One lock covers the final active-job check and the replacement:
-            # a concurrent upload cannot register a new job between them.
-            with jobs_lock:
-                if _processing_job_ids_locked():
+        if ext == '.json':
+            rows = _fingerprint_rows(upload.stream)
+            stats = (sqlmigrate.restore(rows, keep_login=g.user['login'])
+                     if rows['fingerprints'] else dict.fromkeys(sqlmigrate.TABLES, 0))
+        else:
+            with sqlmigrate.staged_rows(upload.stream, replace=replace) as rows, jobs_lock:
+                active = _processing_job_ids_locked()
+                if replace and active:
                     flash('Полная замена невозможна, пока выполняются проверки')
                     return redirect(url_for('admin_migration'))
-                stats = sqlmigrate.restore(rows, replace=True,
-                                           keep_login=g.user['login'])
-                # Persisted rows are now authoritative. Completed jobs cached
-                # by this process must not override the replacement until a
-                # restart.
-                jobs.clear()
-        else:
-            stats = sqlmigrate.restore(rows, replace=False,
-                                       keep_login=g.user['login'])
+                stats = _restore_database(rows, replace, active)
+                for jid in list(jobs):
+                    if jobs[jid].get('status') != 'processing':
+                        del jobs[jid]
     except Exception as exc:
         flash(f'Дамп не загружен: {exc}')
         return redirect(url_for('admin_migration'))
 
     accounts.record_event(g.user['login'], True, _client_ip(),
                           request.headers.get('User-Agent', ''),
-                          'загрузка базы из SQL')
+                          'загрузка базы из ' + ext[1:].upper())
     flash('Дамп загружен. Учётных записей: {users}, проверок: {jobs}, '
           'отпечатков: {fingerprints}, записей журнала: {login_events}, '
           'групп преподавателей: {teams}.'
           .format(**stats))
-    if rows.get('skipped'):
-        flash(f'Пропущено непонятных инструкций: {rows["skipped"]} – '
-              'загружаются только INSERT в таблицы базы.')
     return redirect(url_for('admin_migration'))
 
 
@@ -1448,11 +1561,25 @@ def _job_report(job_id: str):
         abort(404)
     if not _may_view(job, g.user):
         return _deny('Эта проверка принадлежит другому преподавателю.')
+    if job.get('status', 'done') != 'done':
+        abort(404)
     # Serve directly from disk, works across worker restarts and multi-tab use.
     report_path = REPORTS_DIR / f'{job_id}.html'
     if not report_path.exists():
         abort(404)
-    return send_file(str(report_path.resolve()), mimetype='text/html')
+    if has_current_report_controls(report_path):
+        response = send_file(report_path.resolve(), mimetype='text/html')
+    else:
+        # Archived controls may have a different hash. Keep their content visible
+        # when the browser declines to execute the older script.
+        def expanded_report():
+            with report_path.open('rb') as file:
+                yield from iter(lambda: file.read(64 * 1024), b'')
+            yield b'<style>.report-body,.section-body{display:block!important}</style>'
+
+        response = app.response_class(expanded_report(), mimetype='text/html')
+    response.headers['Content-Security-Policy'] = REPORT_CSP
+    return response
 
 
 def _job_export(job_id: str):
@@ -1464,7 +1591,7 @@ def _job_export(job_id: str):
         return _deny('Эта проверка принадлежит другому преподавателю.')
 
     report_path = REPORTS_DIR / f'{job_id}.html'
-    if not report_path.exists():
+    if job.get('status', 'done') != 'done' or not report_path.exists():
         abort(404)
 
     if not WEASYPRINT_OK:
@@ -1474,6 +1601,7 @@ def _job_export(job_id: str):
     pdf_bytes = WeasyHTML(
         string=html_content,
         base_url=str(report_path.parent.absolute()),
+        url_fetcher=pdf_resource_fetcher(),
     ).write_pdf()
 
     return send_file(
@@ -1857,11 +1985,15 @@ def user_create():
     elif accounts.password_problem(password):
         flash(accounts.password_problem(password))
     else:
-        accounts.create_user(
-            login=login_name, fio=fio, password=password,
-            role=form.get('role', 'teacher'), email=form.get('email', '').strip(),
-            must_change=_must_change(form))
-        flash(f'Учётная запись {login_name} создана – сообщите пароль лично.')
+        try:
+            accounts.create_user(
+                login=login_name, fio=fio, password=password,
+                role=form.get('role', 'teacher'), email=form.get('email', '').strip(),
+                must_change=_must_change(form))
+        except accounts.LoginUnavailable as exc:
+            flash(str(exc))
+        else:
+            flash(f'Учётная запись {login_name} создана – сообщите пароль лично.')
     return redirect(url_for('admin_users'))
 
 
@@ -1875,12 +2007,12 @@ def user_perms(login_name):
     if user['login'] == g.user['login'] and role != 'admin':
         flash('Нельзя снять с себя роль администратора')
         return redirect(url_for('admin_users'))
-    user['role'] = role
-    user['perms'] = {flag: request.form.get(f'perm_{flag}') == 'on'
-                     for flag, _ in accounts.PERMISSIONS}
+    perms = {flag: request.form.get(f'perm_{flag}') == 'on'
+             for flag, _ in accounts.PERMISSIONS}
     if role != 'admin':
-        user['perms']['delete_all'] = False
-    accounts.save_user(user)
+        perms['delete_all'] = False
+    if not accounts.set_permissions(login_name, role, perms):
+        abort(404)
     flash(f'Права обновлены: {user["fio"]}')
     return redirect(url_for('admin_users'))
 
@@ -1900,8 +2032,9 @@ def user_reset_password(login_name):
     if problem:
         flash(f'{user["fio"]}: {problem}')
     else:
-        accounts.set_password(login_name, password,
-                              must_change=_must_change(request.form))
+        if not accounts.set_password(login_name, password,
+                                     must_change=_must_change(request.form)):
+            abort(404)
         flash(f'Пароль для {user["fio"]} изменён – сообщите его лично.')
     return redirect(url_for('admin_users'))
 
@@ -1915,12 +2048,9 @@ def user_state(login_name):
     if user['login'] == g.user['login']:
         flash('Нельзя заблокировать собственную учётную запись')
         return redirect(url_for('admin_users'))
-    blocking = user['state'] != 'blocked'
-    user['state'] = 'blocked' if blocking else 'active'
-    if not blocking:
-        user['fail_count'] = 0
-        user['locked_until'] = ''
-    accounts.save_user(user)
+    blocking = accounts.toggle_blocked(login_name)
+    if blocking is None:
+        abort(404)
     flash(f'{user["fio"]}: {"заблокирован" if blocking else "разблокирован"}')
     return redirect(url_for('admin_users'))
 
@@ -1932,6 +2062,8 @@ def user_apikey(login_name):
     if user is None:
         abort(404)
     key = accounts.issue_api_key(login_name)
+    if not key:
+        abort(404)
     flash(f'Ключ API для {user["fio"]}: {key} – сохраните, второй раз он не покажется')
     return redirect(url_for('admin_users'))
 
@@ -1947,7 +2079,7 @@ def user_delete(login_name):
         # без учётной записи, а заведённый позже тёзка с тем же логином молча
         # получил бы доступ к общей базе группы.
         teams.drop_member(login_name)
-        flash('Учётная запись удалена. Её проверки и отпечатки сохранены.')
+        flash('Учётная запись удалена. Логин закреплён за её архивом.')
     return redirect(url_for('admin_users'))
 
 
@@ -2211,6 +2343,35 @@ def _error_text(exc: Exception, step: str) -> str:
     return f'Проверка прервана: {reason}.{tail}'
 
 
+def _publish_job(job_id, owner, html, reports, completed):
+    """Publish the result and fingerprints as one storage transaction."""
+    from checker.memory_store import add_reports
+
+    target = REPORTS_DIR / f'{job_id}.html'
+    out = tempfile.NamedTemporaryFile(dir=REPORTS_DIR, suffix='.tmp',
+                                      mode='w', encoding='utf-8', delete=False)
+    staged = Path(out.name)
+    published = False
+    try:
+        with out:
+            out.write(html)
+        with jobs_lock:
+            job = jobs[job_id]
+            completed['beat'] = time.time()
+            with sqlmigrate.transaction():
+                add_reports(reports, job_id, owner)
+                job_store.save(job_id, dict(_public_job(job), **completed))
+                staged.replace(target)
+                published = True
+            job.update(completed)
+    except BaseException:
+        if published:
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def _process_job(job_id: str, tmp_dir: str, threshold: float,
                  owner: str, enabled_checks=None, use_memory=True,
                  weights=None, scale=grading.DEFAULT_SCALE):
@@ -2218,7 +2379,7 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
     threading.Thread(target=_beat, args=(job_id, stop_beat), daemon=True).start()
     try:
         from checker.memory_store import (load_store, to_virtual_report,
-                                          add_reports, student_id, NO_STUDENT)
+                                          student_id, NO_STUDENT)
 
         # 0. Unpack what was uploaded and bring every format to PDF.
         pdf_paths, origins, failures = _collect_docs(job_id, tmp_dir)
@@ -2318,24 +2479,17 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
             reports, historical, text_plag, img_plag, threshold, job_id=job_id,
             weights=weights, scale=scale
         )
-        (REPORTS_DIR / f'{job_id}.html').write_text(html, encoding='utf-8')
-
-        # 8. Persist fingerprints to this teacher's base. The JSON backend
-        #    replaces its growing file once per batch, not once per report;
-        #    version assignment remains atomic inside memory_store.
         _update(job_id, progress=95, step='Сохранение отпечатков в базу…')
         saveable = [r for r in reports if not r.get('error')]
-        add_reports(saveable, job_id, owner)
-        saved = len(saveable)
-
         not_read = (f' Не удалось прочитать: {len(failures)}.' if failures else '')
-        _update(job_id,
-                status='done',
-                progress=100,
-                summary=summary_mod.build(reports, historical, text_plag,
-                                          img_plag, threshold, weights, scale),
-                step=f'Готово! Проверено {n} отчётов, '
-                     f'сохранено в базу: {saved}.{not_read}')
+        completed = dict(
+            status='done', progress=100,
+            summary=summary_mod.build(reports, historical, text_plag,
+                                      img_plag, threshold, weights, scale),
+            step=f'Готово! Проверено {n} отчётов, '
+                 f'сохранено в базу: {len(saveable)}.{not_read}',
+        )
+        _publish_job(job_id, owner, html, saveable, completed)
 
     except JobCancelled:
         # Ни отчёта, ни отпечатков: последняя точка остановки стоит перед седьмым
@@ -2464,6 +2618,7 @@ def api_memory_delete(key):
 
 
 app.register_blueprint(api)
+_startup()
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ Backed by PostgreSQL when DATABASE_URL is set, otherwise by a JSON file:
   { "<owner>|<name>|<group>|v<N>": { ...entry... }, ... }
 
 Ключ начинается с владельца: базы двух преподавателей не пересекаются даже при
-полном тёзке в одной группе (см. _student_key).
+полном тёзке в одной группе (см. _work_key).
 
 Each entry stores: student info, normalized text, image hashes + thumbnails.
 PIL images are NOT stored, only compact hashes (144 bits × 3 crops) and a
@@ -13,15 +13,18 @@ small JPEG thumbnail per image.
 """
 
 import base64
+import hashlib
 import io
-import threading
+import json
 from datetime import datetime
 from pathlib import Path
+
+from PIL import Image
 
 from checker import db, jsonstore
 
 STORE_PATH = Path(__file__).parent.parent / 'memory' / 'store.json'
-_lock = threading.Lock()
+_lock = jsonstore.lock
 
 
 def _read_all() -> dict:
@@ -71,7 +74,7 @@ def clear_store(owner=None) -> int:
         store = _read_all()
         if owner is None:
             count = len(store)
-            STORE_PATH.unlink(missing_ok=True)
+            jsonstore.unlink(STORE_PATH, missing_ok=True)
             return count
         doomed = [k for k, v in store.items() if v.get('owner', '') == owner]
         for k in doomed:
@@ -138,31 +141,100 @@ def student_id(student: dict) -> str:
     return f'{name}|{group}' if name else NO_STUDENT
 
 
-def _student_key(report: dict, owner: str = '') -> str:
-    """Owner-scoped identity of a student's work. The owner prefix keeps two
-    teachers' bases apart even when they have a namesake in the same group."""
-    return f'{owner}|{student_id(report.get("student", {}))}'
+def _work_key(entry: dict) -> str:
+    owner = entry.get('owner', '')
+    student = entry.get('student') or {}
+    identity = student_id(student)
+    if identity != NO_STUDENT:
+        return f'{owner}|{identity}'
+
+    # A filename such as "report.pdf" can occur in every submission. Only an
+    # exact repeat of the same anonymous work shares its version sequence.
+    from checker.text_plagiarism import text_fingerprint
+    signature = [
+        (student.get('group') or '').strip().casefold(),
+        (entry.get('filename') or '').strip().casefold(),
+        entry.get('text_hash') or text_fingerprint(entry.get('normalized_text', '')),
+        entry.get('pages_count', 0),
+        [(img.get('page'), img['hashes']) for img in entry.get('image_data', [])
+         if isinstance(img, dict) and img.get('hashes')],
+    ]
+    digest = hashlib.sha256(json.dumps(signature, separators=(',', ':')).encode())
+    return f'{owner}||anon:{digest.hexdigest()}'
 
 
-def _make_thumb(pil_img) -> str:
-    thumb = pil_img.copy()
-    thumb.thumbnail((120, 96))
-    buf = io.BytesIO()
-    thumb.save(buf, format='JPEG', quality=55)
-    return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
+def migrate_anonymous_versions() -> None:
+    """Split old anonymous buckets, preserving public entry keys and URLs."""
+    with (db.transaction() if db.DB_ENABLED else _lock) as conn:
+        if db.DB_ENABLED:
+            conn.execute("LOCK TABLE fingerprints IN SHARE ROW EXCLUSIVE MODE")
+            # Current stores don't need to materialize historical images and
+            # text at each startup just to discover there is no migration.
+            legacy = conn.execute(
+                "SELECT 1 FROM fingerprints WHERE "
+                "COALESCE(btrim(student->>'name'), '') = '' AND "
+                "NOT starts_with(key_base, COALESCE(owner, '') || '||anon:') LIMIT 1")
+            if legacy.fetchone() is None:
+                return
+        store = load_store()
+        old = []
+        used = {}
+        for key, entry in store.items():
+            base = entry.get('key_base', '')
+            if (student_id(entry.get('student')) == NO_STUDENT
+                    and not base.startswith(f"{entry.get('owner', '')}||anon:")):
+                old.append((key, entry))
+            else:
+                used.setdefault(base, set()).add(entry.get('version', 1))
+        changed = {}
+        next_free = {}
+        for key, entry in sorted(old, key=lambda row: (row[1].get('version', 1), row[0])):
+            base = _work_key(entry)
+            version = next_free.get(base, 1)
+            occupied = used.get(base, ())
+            while version in occupied:
+                version += 1
+            next_free[base] = version + 1
+            changed[key] = dict(entry, key_base=base, version=version)
+        if changed:
+            save_store(changed)
+
+
+_PREVIEW_PREFIX = 'data:image/jpeg;base64,'
+# Reports create thumbnails no larger than 200 x 160, stored ones are 120 x 96.
+_MAX_PREVIEW_URI = 256 * 1024
+
+
+def _preview_image(uri):
+    if (not isinstance(uri, str) or len(uri) > _MAX_PREVIEW_URI
+            or not uri.startswith(_PREVIEW_PREFIX)):
+        raise ValueError('Invalid thumbnail')
+    raw = base64.b64decode(uri[len(_PREVIEW_PREFIX):], validate=True)
+    with Image.open(io.BytesIO(raw), formats=('JPEG',)) as img:
+        if img.width > 200 or img.height > 160:
+            raise ValueError('Oversized thumbnail')
+        return img.convert('RGB')
+
+
+def valid_preview(uri) -> bool:
+    try:
+        with _preview_image(uri):
+            return True
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return False
 
 
 def _shrink_thumb(data_uri: str) -> str:
-    """Re-encode the report-sized thumbnail (200×160) down to the compact
-    store size (120×96) so the persistent store does not grow."""
     if not data_uri:
         return ''
     try:
-        from PIL import Image
-        raw = base64.b64decode(data_uri.split(',', 1)[1])
-        return _make_thumb(Image.open(io.BytesIO(raw)))
-    except Exception:
-        return data_uri
+        with _preview_image(data_uri) as img:
+            img.thumbnail((120, 96))
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=55)
+        return _PREVIEW_PREFIX + base64.b64encode(buf.getvalue()).decode()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        return ''
 
 
 def _entry_for(report: dict, job_id: str, owner: str) -> tuple:
@@ -181,10 +253,8 @@ def _entry_for(report: dict, job_id: str, owner: str) -> tuple:
             'is_ui':  img_info.get('is_ui', False),
         })
 
-    key_base = _student_key(report, owner)
     normalized_text = normalize_text(report.get('full_text', ''))
-    return key_base, {
-        'key_base':        key_base,
+    entry = {
         'filename':        report.get('filename', ''),
         'student':         report.get('student', {}),
         'normalized_text': normalized_text,
@@ -195,6 +265,9 @@ def _entry_for(report: dict, job_id: str, owner: str) -> tuple:
         'job_id':          job_id,
         'owner':           owner,
     }
+    key_base = _work_key(entry)
+    entry['key_base'] = key_base
+    return key_base, entry
 
 
 def add_reports(reports: list, job_id: str, owner: str = '') -> list:
@@ -214,8 +287,7 @@ def add_reports(reports: list, job_id: str, owner: str = '') -> list:
         return []
 
     if db.DB_ENABLED:
-        return [db.fp_insert_versioned(key_base, entry)
-                for key_base, entry in prepared]
+        return db.fp_insert_batch(prepared)
 
     with _lock:
         store = _read_all()
@@ -254,7 +326,7 @@ def to_virtual_report(entry_key: str, entry: dict) -> dict:
             # Keep compact strings in memory. The image checker converts one
             # historical report at a time and drops the ImageHash objects.
             'hashes': [str(value) for value in hashes],
-            'thumb':  item.get('thumb'),
+            'thumb':  item['thumb'] if valid_preview(item.get('thumb')) else '',
             'is_ui':  item.get('is_ui', False),
         })
 

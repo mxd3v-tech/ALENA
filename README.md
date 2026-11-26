@@ -108,13 +108,13 @@ LibreOffice: все форматы приводятся к PDF
 
 ```bash
 cp .env.example .env
-# отредактируйте .env: POSTGRES_PASSWORD и SECRET_KEY обязательны
+# отредактируйте .env: задайте AU_PASSWORD, POSTGRES_PASSWORD, соответствующий DATABASE_URL и SECRET_KEY
 docker compose up --build
 ```
 
 Откройте <http://localhost:5000> и войдите под учётной записью из `AU_USERNAME`
-и `AU_PASSWORD`. При пароле, похожем на стандартный, система попросит сменить
-его при первом входе.
+и `AU_PASSWORD`. Для новой установки задайте уникальный пароль минимум из 10 символов
+с буквами и цифрами. При обновлении существующей базы используются сохранённые учётные записи.
 
 Образ уже содержит LibreOffice, шрифты Microsoft и библиотеки WeasyPrint –
 ничего доустанавливать не нужно. Собирать его самому не обязательно: сборки с
@@ -128,6 +128,7 @@ docker pull mxd3v-tech/alena:latest
 
 ```bash
 pip install -r requirements.txt
+read -rsp "AU_PASSWORD: " AU_PASSWORD && export AU_PASSWORD && echo
 python app.py            # http://localhost:5000
 python app.py 8080       # другой порт
 ```
@@ -343,6 +344,18 @@ curl -H "X-API-Key: $AU_API_KEY" http://localhost:5000/api/v1/jobs/<job_id>/expo
 «восстановить базу» не означает «выполнить произвольный SQL».
 Режим **Полная замена** удаляет текущие данные, поэтому требует `delete_all`,
 ввода логина администратора и отсутствия выполняющихся проверок.
+Перед записью приложение проверяет полноту и структуру дампа. Реквизиты администратора,
+выполняющего импорт, сохраняются. JSON из раздела **База отчётов** загружается на
+той же странице в режиме добавления отпечатков. Перед переносом через JSON заведите
+учётные записи преподавателей с исходными логинами. Отсутствующие логины резервируются за архивом.
+После восстановления базы скопируйте соответствующие HTML-отчёты в каталог `reports/`.
+Если используется обратный прокси, его лимит размера
+запроса для страницы импорта должен вмещать файл дампа.
+
+После обновления на версию с идентификаторами учётных записей пользователям
+понадобится войти заново. Действующие ключи API сохраняют силу. В хранилище и
+новых дампах сохраняются их хеши. Логин удалённой учётной записи резервируется,
+чтобы её история оставалась за прежним владельцем.
 
 Каталоги `memory/`, `reports/` и файл `.env` – это состояние времени
 выполнения, а не код; они исключены из репозитория.
@@ -518,13 +531,13 @@ match their own stored fingerprint from last session.
 
 ```bash
 cp .env.example .env
-# edit .env: POSTGRES_PASSWORD and SECRET_KEY are required
+# edit .env: set AU_PASSWORD, POSTGRES_PASSWORD, the matching DATABASE_URL and SECRET_KEY
 docker compose up --build
 ```
 
-Open <http://localhost:5000> and sign in with `AU_USERNAME` / `AU_PASSWORD`. If
-the password looks like a default, the account is asked to change it at first
-login.
+Open <http://localhost:5000> and sign in with `AU_USERNAME` / `AU_PASSWORD`.
+A new installation requires a unique password of at least 10 characters with letters
+and digits. Existing installations use the accounts already in storage.
 
 The image already contains LibreOffice, the Microsoft fonts and the WeasyPrint
 libraries – nothing else to install. Building it yourself is optional: every
@@ -538,6 +551,7 @@ docker pull mxd3v-tech/alena:latest
 
 ```bash
 pip install -r requirements.txt
+read -rsp "AU_PASSWORD: " AU_PASSWORD && export AU_PASSWORD && echo
 python app.py            # http://localhost:5000
 python app.py 8080       # another port
 ```
@@ -759,6 +773,16 @@ The importer parses the dump with its own parser and **never executes it** –
 "restore the base" is not "run arbitrary SQL".
 **Полная замена** (full replacement) is destructive and therefore requires
 `delete_all`, the administrator's typed login, and no processing checks.
+The importer validates the backup before applying it and preserves the credentials
+of the administrator performing the import. The same page imports fingerprint JSON
+from **База отчётов** in merge mode. Before importing JSON, set up the teachers' accounts
+under their original logins. Missing logins are reserved for the archived records.
+After restoring the database, copy its HTML reports into `reports/`.
+For a large backup, allow its request size on the import route at the reverse proxy.
+
+On upgrading to account IDs, users sign in again. Existing API keys continue to work.
+Storage and new backups hold their hashes. Deleted logins stay reserved so their
+history stays with the original owner.
 
 `memory/`, `reports/` and `.env` are runtime state, not code, and are excluded
 from the repository.

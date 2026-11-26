@@ -11,9 +11,11 @@ Backed by PostgreSQL when DATABASE_URL is set, otherwise by JSON files next to
 the fingerprint store (same fallback strategy as checker/memory_store.py).
 """
 
+import hashlib
 import os
+import re
 import secrets
-import threading
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,9 +27,8 @@ DATA_DIR    = Path(__file__).parent.parent / 'memory'
 USERS_PATH  = DATA_DIR / 'users.json'
 LOG_PATH    = DATA_DIR / 'login_log.json'
 CONF_PATH   = DATA_DIR / 'settings.json'
-LOG_KEEP    = 2000            # JSON fallback keeps the journal bounded
 
-_lock = threading.Lock()
+_lock = jsonstore.lock
 
 ROLES = {'admin': 'Администратор', 'teacher': 'Преподаватель'}
 
@@ -90,10 +91,11 @@ def _write_json(path: Path, value) -> None:
 
 # Accounts
 
-def load_users() -> dict:
-    if db.DB_ENABLED:
-        return db.users_load_all()
-    return _read_json(USERS_PATH, {})
+def load_users(include_deleted: bool = False) -> dict:
+    users = db.users_load_all() if db.DB_ENABLED else _read_json(USERS_PATH, {})
+    if include_deleted:
+        return users
+    return {k: v for k, v in users.items() if v.get('state') != 'deleted'}
 
 
 def get_user(login: str):
@@ -102,7 +104,29 @@ def get_user(login: str):
     return load_users().get(login)
 
 
+def _api_digest(key: str) -> str:
+    return 'sha256:' + hashlib.sha256(key.encode('utf-8')).hexdigest()
+
+
+def normalize_user(user: dict) -> dict:
+    """Upgrade legacy records, including plaintext API credentials in old dumps."""
+    user = dict(user)
+    if not user.get('state'):
+        user['state'] = 'pending' if user.get('must_change') else 'active'
+    legacy = not user.get('account_id')
+    if legacy:
+        user['account_id'] = secrets.token_hex(16)
+    key = user.get('api_key')
+    if key and (legacy or not re.fullmatch(r'sha256:[0-9a-f]{64}', key)):
+        user['api_key'] = _api_digest(key)
+    if user.get('state') == 'deleted':
+        user.update(password_hash='!', api_key=None, perms={}, role='teacher')
+    return user
+
+
 def save_user(user: dict) -> None:
+    """Restore a complete, validated account record."""
+    user = normalize_user(user)
     if db.DB_ENABLED:
         db.users_save(user)
         return
@@ -112,74 +136,164 @@ def save_user(user: dict) -> None:
         _write_json(USERS_PATH, users)
 
 
-def delete_user(login: str) -> bool:
+@contextmanager
+def _edit_user(login: str):
+    """Keep lookup, validation and update of a single account atomic."""
     if db.DB_ENABLED:
-        return db.users_delete(login)
+        with db.users_edit(login) as user:
+            yield user
+        return
     with _lock:
         users = _read_json(USERS_PATH, {})
-        if login not in users:
+        user = users.get(login)
+        before = user.copy() if user else None
+        yield user
+        if user != before:
+            _write_json(USERS_PATH, users)
+
+
+def _insert_user(user: dict) -> bool:
+    if db.DB_ENABLED:
+        return db.users_save(user, new=True)
+    with _lock:
+        users = _read_json(USERS_PATH, {})
+        if user['login'] in users:
             return False
-        del users[login]
+        users[user['login']] = user
         _write_json(USERS_PATH, users)
+        return True
+
+
+def _archived(login: str, account_id: str) -> dict:
+    return {'login': login, 'account_id': account_id, 'state': 'deleted',
+            'fio': '', 'role': 'teacher', 'password_hash': '!', 'api_key': None,
+            'perms': {}, 'must_change': False, 'fail_count': 0}
+
+
+def reserve_logins(logins) -> None:
+    """Preserve ownership when importing historical rows without user records."""
+    with nullcontext() if db.DB_ENABLED else _lock:
+        users = load_users(include_deleted=True)
+        missing = {login for login in logins if login and login not in users}
+        if not missing:
+            return
+        archived = {login: _archived(login, secrets.token_hex(16)) for login in missing}
+        if db.DB_ENABLED:
+            for user in archived.values():
+                db.users_save(user, new=True)
+        else:
+            users.update(archived)
+            _write_json(USERS_PATH, users)
+
+
+def delete_user(login: str) -> bool:
+    with _edit_user(login) as user:
+        if not user or user.get('state') == 'deleted':
+            return False
+        archived = _archived(login, user['account_id'])
+        user.clear()
+        user.update(archived)
     return True
 
 
+def login_in_history(login: str) -> bool:
+    """Legacy versions physically removed accounts but kept their ownership."""
+    if db.DB_ENABLED:
+        return db.users_login_in_history(login)
+    from checker import job_store, memory_store, teams
+    return bool(job_store.count(login) or memory_store.load_store(login)
+                or teams.teams_of(login)
+                or any(e.get('reason') != 'учётной записи не существует'
+                       for e in recent_logins(None, login)))
+
+
+class LoginUnavailable(ValueError):
+    """An existing account or historical record owns this login."""
+
+
 def create_user(login: str, fio: str, password: str, role: str = 'teacher',
-                email: str = '', perms=None, must_change: bool = True) -> dict:
+                email: str = '', perms=None, must_change: bool = True,
+                api_key: str = '') -> dict:
+    now = datetime.now().strftime(_STAMP)
     user = {
         'login':         login,
+        'account_id':    secrets.token_hex(16),
         'fio':           fio,
         'email':         email,
         'role':          role,
         'state':         'pending' if must_change else 'active',
         'password_hash': generate_password_hash(password),
         'perms':         perms if perms is not None else default_perms(role),
-        'api_key':       None,
+        'api_key':       _api_digest(api_key) if api_key else None,
         'must_change':   must_change,
-        'created_at':    datetime.now().strftime(_STAMP),
-        'pw_changed_at': datetime.now().strftime(_STAMP),
+        'created_at':    now,
+        'pw_changed_at': now,
         'last_login':    '',
         'fail_count':    0,
         'locked_until':  '',
     }
-    save_user(user)
+    with db.transaction() if db.DB_ENABLED else _lock:
+        if login_in_history(login) or not _insert_user(user):
+            raise LoginUnavailable(f'Логин {login} уже занят или закреплён за архивом')
     return user
 
 
-def set_password(login: str, password: str, must_change: bool = False) -> bool:
-    user = get_user(login)
-    if user is None:
-        return False
-    user['password_hash'] = generate_password_hash(password)
-    user['must_change'] = must_change
-    user['pw_changed_at'] = datetime.now().strftime(_STAMP)
-    user['fail_count'] = 0
-    user['locked_until'] = ''
-    if user['state'] == 'pending' and not must_change:
-        user['state'] = 'active'
-    elif must_change:
-        user['state'] = 'pending'
-    save_user(user)
+def set_password(login: str, password: str, must_change: bool = False, *,
+                 current: str | None = None) -> bool:
+    with _edit_user(login) as user:
+        if not user or user['state'] == 'deleted':
+            return False
+        if current is not None:
+            if user['state'] == 'blocked' or not check_password_hash(user['password_hash'], current):
+                return False
+            if password == current:
+                raise ValueError('Новый пароль должен отличаться от текущего')
+        user.update(password_hash=generate_password_hash(password),
+                    must_change=must_change, pw_changed_at=datetime.now().strftime(_STAMP),
+                    fail_count=0, locked_until='')
+        if user['state'] != 'blocked':
+            user['state'] = 'pending' if must_change else 'active'
     return True
 
 
+def set_permissions(login: str, role: str, perms: dict) -> bool:
+    with _edit_user(login) as user:
+        if not user or user['state'] == 'deleted':
+            return False
+        user.update(role=role, perms=perms)
+    return True
+
+
+def toggle_blocked(login: str):
+    with _edit_user(login) as user:
+        if not user or user['state'] == 'deleted':
+            return None
+        blocking = user['state'] != 'blocked'
+        if blocking:
+            user['state'] = 'blocked'
+        else:
+            user['state'] = 'pending' if user.get('must_change') else 'active'
+            user.update(fail_count=0, locked_until='')
+        return blocking
+
+
 def issue_api_key(login: str):
-    """Generate and store a new API key for the account. Returns the key."""
-    user = get_user(login)
-    if user is None:
-        return None
-    key = secrets.token_hex(24)
-    user['api_key'] = key
-    save_user(user)
-    return key
+    """Only the issuing response receives the bearer credential."""
+    with _edit_user(login) as user:
+        if not user or user['state'] == 'deleted':
+            return None
+        key = secrets.token_hex(24)
+        user['api_key'] = _api_digest(key)
+        return key
 
 
 def user_by_api_key(key: str):
     if not key:
         return None
+    digest = _api_digest(key)
     for user in load_users().values():
         stored = user.get('api_key')
-        if stored and secrets.compare_digest(stored, key):
+        if stored and secrets.compare_digest(stored, digest):
             return user
     return None
 
@@ -243,7 +357,7 @@ def record_event(login: str, ok: bool, ip: str, ua: str, reason: str = '') -> No
     with _lock:
         log = _read_json(LOG_PATH, [])
         log.insert(0, event)
-        _write_json(LOG_PATH, log[:LOG_KEEP])
+        _write_json(LOG_PATH, log)
 
 
 def add_events(events: list) -> int:
@@ -261,7 +375,7 @@ def add_events(events: list) -> int:
     with _lock:
         log = _read_json(LOG_PATH, [])
         log = list(reversed(events)) + log
-        _write_json(LOG_PATH, log[:LOG_KEEP])
+        _write_json(LOG_PATH, log)
     return len(events)
 
 
@@ -303,21 +417,24 @@ def authenticate(login: str, password: str, ip: str, ua: str):
 
     Returns (user, error_message). user is None whenever error_message is set.
     """
-    conf = get_settings()
-    user = get_user(login)
+    with db.transaction() if db.DB_ENABLED else _lock:
+        conf = get_settings()
+        with _edit_user(login) as user:
+            result, error, reason = _check_login(user, password, conf)
+        record_event(login, result is not None, ip, ua, reason)
+    return result, error
 
-    if user is None:
-        record_event(login, False, ip, ua, 'учётной записи не существует')
-        return None, 'Неверный логин или пароль'
+
+def _check_login(user, password: str, conf: dict):
+    if not user or user['state'] == 'deleted':
+        return None, 'Неверный логин или пароль', 'учётной записи не существует'
 
     if user.get('state') == 'blocked':
-        record_event(login, False, ip, ua, 'учётная запись заблокирована')
-        return None, 'Учётная запись заблокирована. Обратитесь к администратору.'
+        return None, 'Учётная запись заблокирована. Обратитесь к администратору.', 'учётная запись заблокирована'
 
     left = _locked_for(user)
     if left:
-        record_event(login, False, ip, ua, 'вход временно закрыт')
-        return None, f'Слишком много неудачных попыток. Вход откроется через {left} мин.'
+        return None, f'Слишком много неудачных попыток. Вход откроется через {left} мин.', 'вход временно закрыт'
 
     if not check_password_hash(user['password_hash'], password):
         user['fail_count'] = int(user.get('fail_count', 0)) + 1
@@ -328,9 +445,7 @@ def authenticate(login: str, password: str, ip: str, ua: str):
             user['locked_until'] = (datetime.now() + timedelta(minutes=minutes)).isoformat()
             user['fail_count'] = 0
             reason = f'неверный пароль, вход закрыт на {minutes} мин.'
-        save_user(user)
-        record_event(login, False, ip, ua, reason)
-        return None, 'Неверный логин или пароль'
+        return None, 'Неверный логин или пароль', reason
 
     user['fail_count'] = 0
     user['locked_until'] = ''
@@ -340,10 +455,7 @@ def authenticate(login: str, password: str, ip: str, ua: str):
     expired = password_expired(user, conf)
     if expired:
         user['must_change'] = True
-    save_user(user)
-    record_event(login, True, ip, ua,
-                 'срок действия пароля истёк, требуется смена' if expired else '')
-    return user, ''
+    return user, '', ('срок действия пароля истёк, требуется смена' if expired else '')
 
 
 # System settings
@@ -356,13 +468,13 @@ def get_settings() -> dict:
 
 
 def save_settings(conf: dict) -> None:
-    merged = get_settings()
-    merged.update(conf)
-    if db.DB_ENABLED:
-        db.settings_save(merged)
-        return
-    with _lock:
-        _write_json(CONF_PATH, merged)
+    with nullcontext() if db.DB_ENABLED else _lock:
+        merged = get_settings()
+        merged.update(conf)
+        if db.DB_ENABLED:
+            db.settings_save(merged)
+        else:
+            _write_json(CONF_PATH, merged)
 
 
 # First run
@@ -370,26 +482,30 @@ def save_settings(conf: dict) -> None:
 def bootstrap() -> None:
     """Create the first administrator when the account list is empty, using
     AU_USERNAME / AU_PASSWORD so existing installations keep working."""
-    try:
-        if load_users():
+    with db.transaction() if db.DB_ENABLED else _lock:
+        if db.DB_ENABLED:
+            with db._conn() as conn:
+                conn.execute('LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE')
+        users = load_users(include_deleted=True)
+        if users:
+            upgraded = {login: normalize_user(user) for login, user in users.items()}
+            if upgraded != users:
+                if db.DB_ENABLED:
+                    for login, user in upgraded.items():
+                        if user != users[login]:
+                            db.users_save(user)
+                else:
+                    _write_json(USERS_PATH, upgraded)
             return
-    except Exception:
-        return   # storage not reachable yet; retried on the next request
 
-    login = os.environ.get('AU_USERNAME', 'admin').strip() or 'admin'
-    password = os.environ.get('AU_PASSWORD', 'admin')
-    try:
-        policy_first = bool(get_settings().get('pw_require_change_first'))
-    except Exception:
-        policy_first = bool(DEFAULT_SETTINGS['pw_require_change_first'])
-    user = create_user(
-        login=login,
-        fio=os.environ.get('AU_FIO', 'Администратор системы'),
-        password=password,
-        role='admin',
-        must_change=(password in ('admin', 'changeme', '') or policy_first),
-    )
-    legacy_key = os.environ.get('AU_API_KEY', '').strip()
-    if legacy_key:
-        user['api_key'] = legacy_key
-        save_user(user)
+        login = os.environ.get('AU_USERNAME', 'admin').strip() or 'admin'
+        password = os.environ.get('AU_PASSWORD', '')
+        problem = password_problem(password)
+        if password in ('admin', 'changeme') or problem:
+            raise RuntimeError('Для первого запуска задайте AU_PASSWORD в окружении. '
+                               + (problem or 'Выберите собственный пароль.'))
+        create_user(login=login,
+                    fio=os.environ.get('AU_FIO', 'Администратор системы'),
+                    password=password, role='admin',
+                    must_change=bool(get_settings().get('pw_require_change_first')),
+                    api_key=os.environ.get('AU_API_KEY', '').strip())

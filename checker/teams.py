@@ -14,7 +14,6 @@ Backed by PostgreSQL when DATABASE_URL is set, otherwise by a JSON file next to
 the fingerprint store (same fallback strategy as checker/memory_store.py).
 """
 
-import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +21,7 @@ from pathlib import Path
 from checker import db, jsonstore
 
 STORE_PATH = Path(__file__).parent.parent / 'memory' / 'teams.json'
-_lock = threading.Lock()
+_lock = jsonstore.lock
 
 NAME_MAX = 80
 

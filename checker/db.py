@@ -7,6 +7,8 @@ fallback path works without the package installed.
 """
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 DB_ENABLED = bool(DATABASE_URL)
@@ -66,6 +68,7 @@ SCHEMA = [
     # (настройка pw_expire_days). У записей, заведённых раньше, пусто:
     # отсчёт для них идёт от даты создания.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS pw_changed_at TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS account_id TEXT",
     """
     CREATE TABLE IF NOT EXISTS login_events (
         id     BIGSERIAL PRIMARY KEY,
@@ -124,8 +127,33 @@ def _get_pool():
     return _pool
 
 
+_active_connection = ContextVar('alena_transaction', default=None)
+
+
+@contextmanager
 def _conn():
-    return _get_pool().connection()
+    conn = _active_connection.get()
+    if conn is None:
+        with _get_pool().connection() as conn:
+            yield conn
+    else:
+        yield conn
+
+
+@contextmanager
+def transaction(snapshot=False):
+    with _conn() as conn:
+        if _active_connection.get() is not None:
+            yield conn
+            return
+        with conn.transaction():
+            if snapshot:
+                conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            token = _active_connection.set(conn)
+            try:
+                yield conn
+            finally:
+                _active_connection.reset(token)
 
 
 # Fingerprints
@@ -202,43 +230,38 @@ def fp_upsert_many(store: dict) -> None:
             )
 
 
-def fp_insert_versioned(key_base: str, entry: dict) -> int:
-    """Вставить отпечаток следующей свободной версией. Возвращает её номер.
+def fp_insert_batch(prepared: list) -> list:
+    """Allocate all versions and insert the batch in one transaction.
 
-    Номер и вставка идут одной транзакцией, а столкновение по первичному ключу
-    гасится повтором: два рабочих процесса, сохраняющих отпечаток одного
-    студента одновременно, получают разные версии, а не затирают друг друга.
+    Imports and deletions also write this table. This lock serializes those
+    writers with version allocation while ordinary SELECTs remain available.
     """
-    from psycopg.errors import UniqueViolation
     from psycopg.types.json import Json
-
-    for _ in range(8):
-        try:
-            with _conn() as conn, conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COALESCE(MAX(version), 0) + 1 FROM fingerprints "
-                    "WHERE key_base = %s", (key_base,))
-                version = cur.fetchone()[0]
-                cur.execute(
-                    """
-                    INSERT INTO fingerprints
-                      (entry_key, key_base, version, filename, student,
-                       normalized_text, text_hash, image_data, pages_count,
-                       job_id, added_at, owner)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (f'{key_base}|v{version}', key_base, version,
-                     entry.get('filename', ''), Json(entry.get('student', {})),
-                      entry.get('normalized_text', ''),
-                      entry.get('text_hash', ''),
-                      Json(entry.get('image_data', [])),
-                     entry.get('pages_count', 0), entry.get('job_id', ''),
-                     entry.get('added_at', ''), entry.get('owner', '')),
-                )
-            return version
-        except UniqueViolation:
-            continue    # номер занял сосед – берём следующий
-    raise RuntimeError('не удалось подобрать свободный номер версии отпечатка')
+    bases = list({key_base for key_base, _ in prepared})
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("LOCK TABLE fingerprints IN SHARE ROW EXCLUSIVE MODE")
+        cur.execute("SELECT key_base, MAX(version) FROM fingerprints "
+                    "WHERE key_base = ANY(%s) GROUP BY key_base", (bases,))
+        latest = dict(cur.fetchall())
+        records = []
+        versions = []
+        for key_base, entry in prepared:
+            version = latest.get(key_base, 0) + 1
+            latest[key_base] = version
+            versions.append(version)
+            records.append((
+                f'{key_base}|v{version}', key_base, version, entry['filename'],
+                Json(entry['student']), entry['normalized_text'], entry['text_hash'],
+                Json(entry['image_data']), entry['pages_count'], entry['job_id'],
+                entry['added_at'], entry['owner'],
+            ))
+        cur.executemany("""
+            INSERT INTO fingerprints
+              (entry_key, key_base, version, filename, student, normalized_text,
+               text_hash, image_data, pages_count, job_id, added_at, owner)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, records)
+    return versions
 
 
 def fp_clear(owner=None) -> int:
@@ -303,6 +326,12 @@ def jobs_count(owner=None) -> int:
         return cur.fetchone()[0]
 
 
+def job_owners() -> dict:
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT job_id, data->>'owner' FROM jobs")
+        return dict(cur.fetchall())
+
+
 def jobs_get(job_id: str):
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT data FROM jobs WHERE job_id = %s", (job_id,))
@@ -328,7 +357,7 @@ def jobs_delete(job_id: str) -> bool:
 
 USER_COLS = ('login', 'fio', 'email', 'role', 'state', 'password_hash',
               'perms', 'api_key', 'must_change', 'created_at', 'pw_changed_at',
-              'last_login', 'fail_count', 'locked_until')
+              'last_login', 'fail_count', 'locked_until', 'account_id')
 
 
 def users_load_all() -> dict:
@@ -342,20 +371,55 @@ def users_load_all() -> dict:
     return out
 
 
-def users_save(user: dict) -> None:
+def _save_user_row(cur, user: dict, *, new: bool = False) -> bool:
     from psycopg.types.json import Json
-    assign = ', '.join(f'{c} = EXCLUDED.{c}' for c in USER_COLS if c != 'login')
-    values = []
-    for c in USER_COLS:
-        v = user.get(c)
-        values.append(Json(v or {}) if c == 'perms' else v)
+    if new:
+        conflict = 'DO NOTHING'
+    else:
+        assign = ', '.join(f'{c} = EXCLUDED.{c}' for c in USER_COLS if c != 'login')
+        conflict = f'DO UPDATE SET {assign}'
+    values = [Json(user.get(c) or {}) if c == 'perms' else user.get(c)
+              for c in USER_COLS]
+    cur.execute(
+        f"INSERT INTO users ({', '.join(USER_COLS)}) "
+        f"VALUES ({', '.join(['%s'] * len(USER_COLS))}) "
+        f"ON CONFLICT (login) {conflict}",
+        values,
+    )
+    return cur.rowcount > 0
+
+
+def users_save(user: dict, *, new: bool = False) -> bool:
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            f"INSERT INTO users ({', '.join(USER_COLS)}) "
-            f"VALUES ({', '.join(['%s'] * len(USER_COLS))}) "
-            f"ON CONFLICT (login) DO UPDATE SET {assign}",
-            values,
-        )
+        return _save_user_row(cur, user, new=new)
+
+
+@contextmanager
+def users_edit(login: str):
+    with _conn() as conn, conn.cursor() as cur:
+        # Take the writer table lock before any row lock, in the same order
+        # as a migration. A later lock upgrade could deadlock with restore.
+        cur.execute("LOCK TABLE users IN ROW EXCLUSIVE MODE")
+        cur.execute(f"SELECT {', '.join(USER_COLS)} FROM users "
+                    "WHERE login = %s FOR UPDATE", (login,))
+        row = cur.fetchone()
+        user = dict(zip(USER_COLS, row)) if row else None
+        before = user.copy() if user else None
+        yield user
+        if user != before:
+            _save_user_row(cur, user)
+
+
+def users_login_in_history(login: str) -> bool:
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (SELECT FROM jobs WHERE data->>'owner' = %s)
+                OR EXISTS (SELECT FROM fingerprints WHERE owner = %s)
+                OR EXISTS (SELECT FROM teams WHERE members ? %s)
+                OR EXISTS (SELECT FROM login_events WHERE login = %s
+                           AND reason IS DISTINCT FROM 'учётной записи не существует')
+            """, (login, login, login, login))
+        return cur.fetchone()[0]
 
 
 def users_delete(login: str) -> bool:
@@ -422,8 +486,10 @@ def log_recent(limit: int = 200, login=None) -> list:
     if login is not None:
         sql += " WHERE login = %s"
         params = (login,)
-    sql += " ORDER BY id DESC LIMIT %s"
-    params += (limit,)
+    sql += " ORDER BY id DESC"
+    if limit is not None:
+        sql += " LIMIT %s"
+        params += (limit,)
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return [{'ts': ts, 'login': lg, 'ok': ok, 'ip': ip, 'ua': ua,
