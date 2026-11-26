@@ -6,7 +6,9 @@ tests/test_regressions.py – там они записаны по следам �
 
 import unittest
 
+from checker import summary
 from checker import text_plagiarism as tp
+from checker.reporter import generate_html_report
 from checker.text_plagiarism import (
     check_text_plagiarism,
     normalize_text,
@@ -131,6 +133,35 @@ class ComparisonTests(unittest.TestCase):
         matrix = check_text_plagiarism(pair, threshold=0.6)['matrix']
         self.assertGreater(matrix['/a.pdf']['/b.pdf'], 0)
 
+    def test_below_threshold_score_is_preserved_after_archiving(self):
+        first = work('/a.pdf', body=text(200))
+        second = work('/b.pdf', body=text(102) + ' ' + text(98, tag='бета'))
+        archived = work('memory://b|v1', normalized_text=normalize_text(second['full_text']),
+                        is_historical=True, student={'name': 'Петров'})
+
+        batch = check_text_plagiarism([first, second], threshold=0.6)
+        history = check_text_plagiarism([first, archived], threshold=0.6)
+        # 98 of 196 five-word shingles coincide in both comparisons.
+        self.assertEqual(batch['matrix'][first['path']][second['path']], 0.5)
+        self.assertEqual(history['matrix'][first['path']][archived['path']], 0.5)
+        self.assertEqual(history['matrix'][archived['path']][first['path']], 0.5)
+        digest = summary.build([first], [archived], history, {}, threshold=0.6)
+        self.assertEqual(digest['students'][0]['plag'], 50)
+        self.assertEqual(digest['matches_total'], 0)
+        html = generate_html_report([first], [archived], history, {}, threshold=0.6)
+        self.assertIn('База (близко)', html)
+        self.assertIn('Петров', html)
+
+    def test_uncompared_author_pair_is_distinct_from_measured_zero_in_html(self):
+        author = {'name': 'Иванов', 'group': 'ИВТ'}
+        fresh = work('/new.pdf', body=text(tag='бета'), student=author)
+        archived = work('memory://old|v1', is_historical=True, student=author)
+        other = work('/copy.pdf')
+        result = check_text_plagiarism([fresh, other, archived])
+        html = generate_html_report([fresh, other], [archived], result, {})
+        self.assertEqual(html.count('title="пара не сравнивалась"'), 2)
+        self.assertEqual(result['matrix'][fresh['path']][other['path']], 0)
+
     def test_a_manual_pasted_into_a_longer_report_is_flagged(self):
         """Студенты переписывают методичку целиком, заменяя её листинги
         скриншотами и добавляя титул и самостоятельную часть. По Жаккару
@@ -151,8 +182,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(len(result['pairs']), 1)
 
     def test_the_same_manual_matches_through_the_stored_base(self):
-        """Тот же случай, когда методичка проверяется против базы: там
-        работает отсев кандидатов, и он не должен терять такие пары."""
+        """Методичка совпадает и с работой из базы прошлых сессий."""
         steps = [text(40, tag=f'шаг{i}') for i in range(8)]
         manual = ' '.join(f'{step} {text(15, tag=f"листинг{i}")}'
                           for i, step in enumerate(steps))

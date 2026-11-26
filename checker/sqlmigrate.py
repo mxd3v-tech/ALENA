@@ -246,15 +246,22 @@ def _pg_integer(value):
     return _integer(value) and value <= 2**31 - 1
 
 
+def _percentage(value):
+    return type(value) in (int, float) and 0 <= value <= 100
+
+
 def _strings(values):
     return isinstance(values, list) and all(isinstance(s, str) for s in values)
 
 
 def _check_summary(summary):
-    for key in ('gost', 'plag', 'grade', 'grade_score', 'threshold', 'scale', 'clean',
+    for key in ('gost', 'grade', 'grade_score', 'scale', 'clean',
                 'matches_total', 'no_text'):
         value = summary.get(key)
         _require(value is None or type(value) in (int, float), f'jobs.summary.{key}')
+    for key in ('plag', 'threshold'):
+        _require(summary.get(key) is None or _percentage(summary[key]), f'jobs.summary.{key}')
+    _require(type(summary.get('plag_flagged', False)) is bool, 'jobs.summary.plag_flagged')
     if 'clean' in summary:
         _require(_integer(summary['clean']), 'jobs.summary.clean')
     fails = summary.get('fail_counts', [])
@@ -268,8 +275,9 @@ def _check_summary(summary):
     for student in summary.get('students', []):
         _require(isinstance(student.get('fio'), str) and _strings(student.get('fails', [])),
                  'jobs.summary.students')
-        for field in ('gost', 'plag'):
-            _require(student.get(field) is None or _integer(student[field]), f'jobs.students.{field}')
+        _require(student.get('gost') is None or _integer(student['gost']), 'jobs.students.gost')
+        _require(student.get('plag') is None or _percentage(student['plag']), 'jobs.students.plag')
+        _require(type(student.get('plag_flagged', False)) is bool, 'jobs.students.plag_flagged')
         grade = student.get('grade')
         if grade is not None:
             _require(isinstance(grade, dict) and all(grade.get(k) is None or
@@ -282,7 +290,7 @@ def _check_summary(summary):
         _require(isinstance(flaws, list) and all(isinstance(row, dict) for row in flaws),
                  'jobs.students.flaws')
     for match in summary.get('matches', []):
-        _require(match.get('pct') is None or _integer(match['pct']), 'jobs.matches.pct')
+        _require(match.get('pct') is None or _percentage(match['pct']), 'jobs.matches.pct')
         _require(isinstance(match.get('pages', []), list) and
                  all(_integer(n) for n in match.get('pages', [])), 'jobs.matches.pages')
 
@@ -298,8 +306,9 @@ def _validate(table, rec):
                  ('done', 'error', 'processing', 'cancelled'), 'jobs.status')
         for field in ('owner', 'owner_fio', 'step', 'created_at', 'error'):
             _require(job.get(field) is None or isinstance(job[field], str), f'jobs.{field}')
-        for field in ('progress', 'total', 'done_files', 'text_pairs', 'img_pairs', 'threshold'):
+        for field in ('progress', 'total', 'done_files', 'text_pairs', 'img_pairs'):
             _require(field not in job or _integer(job[field]), f'jobs.{field}')
+        _require('threshold' not in job or _percentage(job['threshold']), 'jobs.threshold')
         _require(job.get('beat') is None or type(job['beat']) in (int, float), 'jobs.beat')
         _require(job.get('summary') is None or isinstance(job['summary'], dict), 'jobs.summary')
         if job.get('summary') is not None:

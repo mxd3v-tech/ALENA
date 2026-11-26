@@ -62,6 +62,35 @@ class MigrationIntegrityTests(unittest.TestCase):
         self.assertEqual(job_store.count(), 1)
         self.assertEqual(accounts.get_user('admin')['perms'], {})
 
+    def test_backup_round_trips_fractional_and_legacy_similarity_scores(self):
+        current = {'threshold': 60.25, 'plag': 60.5, 'plag_flagged': True,
+                   'students': [{'fio': 'Иванов', 'plag': 60.5, 'plag_flagged': True},
+                                {'fio': 'Петров', 'plag': 59.6, 'plag_flagged': False}],
+                   'matches': [{'pct': 60.5}, {'pct': None}]}
+        legacy = {'threshold': 60, 'plag': 80, 'students': [{'fio': 'Иванов', 'plag': 80}],
+                  'matches': [{'pct': 80}]}
+        for job_id, digest in [('abc123', current), ('fedcba', legacy)]:
+            job_store.save(job_id, {'owner': 'admin', 'status': 'done',
+                                    'threshold': digest['threshold'], 'summary': digest})
+        saved = job_store.load_all()
+        backup = sqlmigrate.dump()
+        job_store.clear()
+        sqlmigrate.restore_file(io.StringIO(backup), replace=True)
+        self.assertEqual(job_store.load_all(), saved)
+
+    def test_invalid_similarity_fields_are_rejected(self):
+        for data, field in [
+            ({'threshold': 100.01}, 'jobs.threshold'),
+            ({'summary': {'plag': -1}}, 'jobs.summary.plag'),
+            ({'summary': {'threshold': True}}, 'jobs.summary.threshold'),
+            ({'summary': {'plag_flagged': 1}}, 'jobs.summary.plag_flagged'),
+            ({'summary': {'students': [{'fio': 'A', 'plag': '60'}]}}, 'jobs.students.plag'),
+            ({'summary': {'students': [{'fio': 'A', 'plag_flagged': 'false'}]}}, 'jobs.students.plag_flagged'),
+            ({'summary': {'matches': [{'pct': False}]}}, 'jobs.matches.pct'),
+        ]:
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, re.escape(field)):
+                sqlmigrate.restore({'jobs': [{'job_id': 'fedcba', 'data': dict(data, status='done')}]})
+
     def test_history_without_account_is_archived_unless_login_was_unknown(self):
         def event(login, reason):
             return {'ts': '01.01.2025', 'login': login, 'ok': False, 'reason': reason}

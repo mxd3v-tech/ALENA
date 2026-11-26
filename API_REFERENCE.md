@@ -138,6 +138,7 @@ List the jobs visible to the caller, keyed by `job_id`:
       "groups": ["ПР-21-1"],
       "gost": 87,
       "plag": 63,
+      "plag_flagged": true,
       "threshold": 60,
       "clean": 8,
       "grade": 74,
@@ -147,7 +148,7 @@ List the jobs visible to the caller, keyed by `job_id`:
       "no_text": 1,
       "students": [
         { "fio": "Петров П. П.", "group": "ПР-21-1", "gost": 61,
-          "plag": 63, "no_text": false, "fails": ["S2", "F3", "F7"],
+          "plag": 63, "plag_flagged": true, "no_text": false, "fails": ["S2", "F3", "F7"],
           "flaws": [
             { "code": "S2", "text": "Отсутствует лист задания на практику (курсовую работу)",
               "details": "Лист задания не обнаружен" }
@@ -159,7 +160,7 @@ List the jobs visible to the caller, keyed by `job_id`:
           "error": null }
       ],
       "matches": [
-        { "a": "Петров П. П.", "b": "Белов А. Р. · ПР-20-1", "pct": 47,
+        { "a": "Петров П. П.", "b": "Белов А. Р. · ПР-20-1", "pct": 63,
           "kind": "текст", "where": "база, 18.06.2025" }
       ],
       "matches_total": 7,
@@ -175,6 +176,13 @@ means the check was stopped on request (see `POST /jobs/<id>/cancel`) and has no
 report and no summary. `summary` is `null` until the check finishes;
 `matches[].pct` is `null` for duplicate images, which are a yes/no match rather
 than a share of the text.
+
+`students[].plag` shows the highest text similarity across the batch and the
+visible archive when archive comparison is enabled. Percentages can be
+fractional. Use `students[].plag_flagged` for the feedback decision. It is true
+when at least one eligible text comparison reached the configured threshold
+before rounding. `summary.plag_flagged` reports the same decision for the whole
+batch. Older summaries can omit these fields.
 
 `students[].no_text` is `true` when too little text could be extracted from the
 file to compare it with anything – a scan, or a PDF whose fonts carry no usable

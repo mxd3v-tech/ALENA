@@ -1,6 +1,5 @@
 """Text plagiarism detection via word n-gram (shingle) containment."""
 import hashlib
-import itertools
 import math
 import re
 from collections import defaultdict
@@ -14,7 +13,6 @@ MIN_PASSAGE_WORDS = 8   # min words to display a common passage
 # сканов обвинялась в списывании целиком. Теперь они выводятся из сравнения и
 # помечаются отдельно: заимствование в них проверяют глазами.
 MIN_COMPARE_WORDS = 30
-PREFILTER_SAMPLE_SIZE = 128
 
 # Схожесть – доля шинглов меньшей работы, найденных в другой, а не Жаккар.
 # Жаккар делит общее на объединение, и вставленная целиком в отчёт методичка
@@ -112,56 +110,6 @@ def _set_similarity(a: set, b: set) -> float:
     return _similarity(a, b, len(a & b))
 
 
-def _shingle_sample(shingles: set) -> set:
-    """Up to 128 hashes for the cheap first pass over a candidate."""
-    if len(shingles) <= PREFILTER_SAMPLE_SIZE:
-        return shingles
-    return set(itertools.islice(shingles, PREFILTER_SAMPLE_SIZE))
-
-
-def _candidate_similarity(a: set, sample_a: set, b: set, sample_b: set,
-                          threshold: float):
-    """Exact similarity for a viable candidate, otherwise ``None`` early.
-
-    The 128-value sample is checked first. We then inspect only as much of the
-    smaller set as needed to prove that the required intersection is
-    unreachable. Unlike rejecting on a missing sample overlap, this has no
-    false negatives at ``threshold``.
-    """
-    if not a or not b:
-        return None
-    if len(a) <= len(b):
-        source, sample, other = a, sample_a, b
-    else:
-        source, sample, other = b, sample_b, a
-
-    def _can_reach(intersection: int, remaining: int) -> bool:
-        upper_intersection = min(len(other), intersection + remaining)
-        return _similarity(a, b, upper_intersection) >= threshold
-
-    if not _can_reach(0, len(source)):
-        return None
-
-    checked = intersection = 0
-    for value in sample:
-        checked += 1
-        if value in other:
-            intersection += 1
-    if not _can_reach(intersection, len(source) - checked):
-        return None
-
-    for value in source:
-        if value in sample:
-            continue
-        checked += 1
-        if value in other:
-            intersection += 1
-        if not _can_reach(intersection, len(source) - checked):
-            return None
-
-    return _similarity(a, b, intersection)
-
-
 def _find_passages(words1: list, words2: list) -> list:
     """Find verbatim shared passages (word sequences >= MIN_PASSAGE_WORDS)."""
     n = MIN_PASSAGE_WORDS
@@ -257,8 +205,6 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
                          if record['path'] not in no_text else set())
         for record in current
     }
-    current_samples = {path: _shingle_sample(shingles)
-                       for path, shingles in current_sets.items()}
 
     paths = [record['path'] for record in records]
     matrix = {p: {p: 1.0} for p in paths}
@@ -268,8 +214,7 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
                    + len(current) * len(historical))
     done_pairs = 0
 
-    def _compare(first, first_set, first_sample,
-                 second, second_set, second_sample, prefilter):
+    def _compare(first, first_set, second, second_set):
         p1, p2 = first['path'], second['path']
         if p1 in no_text or p2 in no_text:
             return
@@ -283,12 +228,8 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
         compared[p1] += 1
         compared[p2] += 1
 
-        sim = (_candidate_similarity(
-            first_set, first_sample, second_set, second_sample, threshold)
-            if prefilter and threshold > 0
-            else _set_similarity(first_set, second_set))
-        if sim is None:
-            return
+        # The summary needs the maximum even if every match is below threshold.
+        sim = _set_similarity(first_set, second_set)
         matrix[p1][p2] = sim
         matrix[p2][p1] = sim
         if sim < threshold:
@@ -302,17 +243,12 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
             'passages': [passage['text'][:300] for passage in passages],
         })
 
-    # The current batch is bounded by the upload and must be compared exactly.
     for i, first in enumerate(current):
         if on_progress is not None:
             on_progress(done_pairs, total_pairs)
         for second in current[i + 1:]:
-            _compare(
-                first, current_sets[first['path']],
-                current_samples[first['path']],
-                second, current_sets[second['path']],
-                current_samples[second['path']], False,
-            )
+            _compare(first, current_sets[first['path']],
+                     second, current_sets[second['path']])
         done_pairs += len(current) - 1 - i
 
     # Expand one historical report at a time and release its full shingle set
@@ -323,13 +259,8 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
             on_progress(done_pairs, total_pairs)
         old_set = (_shingles(old['norm'])
                    if old['path'] not in no_text else set())
-        old_sample = _shingle_sample(old_set)
         for fresh in current:
-            _compare(
-                fresh, current_sets[fresh['path']],
-                current_samples[fresh['path']],
-                old, old_set, old_sample, True,
-            )
+            _compare(fresh, current_sets[fresh['path']], old, old_set)
         done_pairs += len(current)
 
     if on_progress is not None:

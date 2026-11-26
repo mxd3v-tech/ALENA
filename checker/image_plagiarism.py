@@ -181,8 +181,7 @@ def check_image_plagiarism(reports: list, on_progress=None) -> dict:
                 'anonymous': meta['anonymous'],
             })
 
-    pairs = []
-    seen: set = set()
+    best_by_page = {}
 
     m = len(current_imgs)
     total_pairs = m * (m - 1) // 2 + m * historical_count
@@ -198,11 +197,6 @@ def check_image_plagiarism(reports: list, on_progress=None) -> dict:
         if a['student_key'] and a['student_key'] == b['student_key']:
             return
 
-        key = tuple(sorted([(a['report'], a['page']),
-                            (b['report'], b['page'])]))
-        if key in seen:
-            return
-
         pair_is_ui = bool(a.get('is_ui') or b.get('is_ui'))
         if pair_is_ui:
             # Full-image hashes only: crops of a shared UI match trivially and
@@ -210,18 +204,24 @@ def check_image_plagiarism(reports: list, on_progress=None) -> dict:
             dist = a['hashes'][0] - b['hashes'][0]
             if dist > MAX_HAMMING:
                 return
+            full_dist = dist
             is_crop = False
             ui_review = dist > UI_MAX_HAMMING
         else:
             dist = _min_distance(a['hashes'], b['hashes'])
             if dist > MAX_HAMMING:
                 return
-            exact_dist = a['hashes'][0] - b['hashes'][0]
-            is_crop = exact_dist > MAX_HAMMING
+            full_dist = a['hashes'][0] - b['hashes'][0]
+            is_crop = full_dist > MAX_HAMMING
             ui_review = False
 
-        seen.add(key)
-        pairs.append({
+        # Several image pairs can share the same two pages. Confirmed copies
+        # take precedence over UI reviews, then prefer the closest hashes.
+        key = tuple(sorted([(a['report'], a['page']), (b['report'], b['page'])]))
+        rank = (ui_review, dist, full_dist)
+        if key in best_by_page and best_by_page[key][0] <= rank:
+            return
+        best_by_page[key] = rank, {
             'report1': a['report'],
             'page1': a['page'],
             'img1': a.get('thumb') or '',
@@ -232,7 +232,7 @@ def check_image_plagiarism(reports: list, on_progress=None) -> dict:
             'is_crop': is_crop,
             'is_ui': pair_is_ui,
             'ui_review': ui_review,
-        })
+        }
 
     for i, first in enumerate(current_imgs):
         if on_progress is not None:
@@ -271,5 +271,6 @@ def check_image_plagiarism(reports: list, on_progress=None) -> dict:
     if on_progress is not None:
         on_progress(total_pairs, total_pairs)
 
+    pairs = [pair for _, pair in best_by_page.values()]
     pairs.sort(key=lambda x: x['distance'])
     return {'pairs': pairs}

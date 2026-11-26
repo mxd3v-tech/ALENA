@@ -170,7 +170,8 @@
   };
   const chip = (tone, text) => `<span class="chip ${tone}">${ICON[tone]}${esc(text)}</span>`;
   const gostTone = v => v >= 85 ? 'ok' : v >= 70 ? 'warn' : 'crit';
-  const plagTone = (v, threshold) => v >= threshold ? 'crit' : v >= threshold * 0.6 ? 'warn' : 'ok';
+  const plagTone = (v, threshold, flagged = v >= threshold) =>
+    flagged ? 'crit' : threshold > 0 && v >= threshold * 0.6 ? 'warn' : 'ok';
   const toneVar = t => `var(--${t})`;
 
   const plural = (n, forms) => {
@@ -235,7 +236,7 @@
         + 'нестандартные шрифты. Заимствование автоматически не проверено, '
         + 'рекомендуемая оценка за оформление не выводится; нужна ручная проверка');
     }
-    if (st.plag != null && thr != null && st.plag >= thr) {
+    if (st.plag != null && thr != null && (st.plag_flagged ?? (st.plag >= thr))) {
       lines.push(`Совпадение с другой работой – ${st.plag}% (допустимый порог ${thr}%)`);
     }
     return lines;
@@ -395,12 +396,12 @@
 
       ul.innerHTML = list.map(j => {
         const s = j.summary || {};
-        const thr = j.threshold || 60;
+        const thr = s.threshold ?? j.threshold ?? 60;
         let tone, right;
         if (j.status === 'processing') { tone = 'idle'; right = chip('idle', (j.progress || 0) + '%'); }
         else if (j.status === 'cancelled') { tone = 'idle'; right = chip('idle', 'Прервана'); }
         else if (j.status === 'error') { tone = 'crit'; right = chip('crit', 'Ошибка'); }
-        else { tone = plagTone(s.plag || 0, thr); right = chip(tone, 'Заимств. ' + (s.plag || 0) + '%'); }
+        else { tone = plagTone(s.plag || 0, thr, s.plag_flagged); right = chip(tone, 'Заимств. ' + (s.plag || 0) + '%'); }
 
         return `<li role="option" aria-selected="${j.id === selected}">
           <button class="job" data-job="${esc(j.id)}" style="--tone:${toneVar(tone)}" aria-selected="${j.id === selected}">
@@ -450,7 +451,7 @@
       const pane = $('#detail-pane');
       if (!j) { pane.innerHTML = '<div class="empty">Выберите проверку.</div>'; return; }
       const s = j.summary || {};
-      const thr = j.threshold || 60;
+      const thr = s.threshold ?? j.threshold ?? 60;
       const ownsJob = j.owner === login;
       const mayDeleteJob = (ownsJob && canDelete) || (!ownsJob && canDeleteAll);
 
@@ -521,7 +522,7 @@
         wireDelete(); return;
       }
 
-      const gt = gostTone(s.gost || 0), pt = plagTone(s.plag || 0, thr);
+      const gt = gostTone(s.gost || 0), pt = plagTone(s.plag || 0, thr, s.plag_flagged);
       const mark = s.grade == null ? null : s.grade;
       const mt = mark == null ? 'idle' : gostTone(mark);
       const markMeter = mark == null ? '' : `
@@ -549,7 +550,8 @@
               <span class="meter-val" style="color:${toneVar(pt)}">${s.plag || 0}%</span></div>
             <div class="track"><div class="fill" style="width:${s.plag || 0}%;--tone:${toneVar(pt)}"></div></div>
             <div class="meter-note">Порог ${thr}%
-              ${chip(pt, pt === 'ok' ? 'Ниже порога' : pt === 'warn' ? 'Близко к порогу' : 'Выше порога')}</div>
+              ${chip(pt, pt === 'crit' ? 'Порог достигнут' : pt === 'warn' ? 'Близко к порогу'
+                : thr === 0 ? 'Нет сравнимых пар' : 'Ниже порога')}</div>
           </div>
         </div>`;
 
@@ -567,7 +569,7 @@
            читалось бы как «проверено, чисто». */
         const plagCell = st.plag == null
           ? `<td class="num" title="текст не извлечён – сравнение не проводилось">–</td>`
-          : `<td class="num" style="color:${toneVar(plagTone(st.plag, thr))}">${st.plag}%</td>`;
+          : `<td class="num" style="color:${toneVar(plagTone(st.plag, thr, st.plag_flagged))}">${st.plag}%</td>`;
         return `<tr>
           <td>${esc(st.fio)}${st.group ? `<br><span class="sub mono">${esc(st.group)}</span>` : ''}</td>
           <td class="num" style="color:${toneVar(a)}">${st.gost}%</td>

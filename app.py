@@ -860,7 +860,7 @@ def new_check():
                            scale=grading.clean_scale(conf.get('grade_scale')),
                            upload_max_mb=UPLOAD_MAX_MB,
                            upload_max_text=_mb_text(UPLOAD_MAX_MB),
-                           threshold=int(float(conf.get('default_threshold', 0.6)) * 100))
+                           threshold=grading.as_percent(float(conf.get('default_threshold', 0.6))))
 
 
 @app.route('/base')
@@ -1526,7 +1526,7 @@ def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
             'beat':       time.time(),
             'owner':      owner['login'],
             'owner_fio':  owner.get('fio', owner['login']),
-            'threshold':  round(threshold * 100),
+            'threshold':  grading.as_percent(threshold),
             'summary':    None,
             'report_html': None,
             'error':      None,
@@ -2378,8 +2378,7 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
     stop_beat = threading.Event()
     threading.Thread(target=_beat, args=(job_id, stop_beat), daemon=True).start()
     try:
-        from checker.memory_store import (load_store, to_virtual_report,
-                                          student_id, NO_STUDENT)
+        from checker.memory_store import load_store, to_virtual_report
 
         # 0. Unpack what was uploaded and bring every format to PDF.
         pdf_paths, origins, failures = _collect_docs(job_id, tmp_dir)
@@ -2391,13 +2390,12 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
             return
         _update(job_id, progress=4, total=n, step=f'К проверке принято работ: {n}')
 
-        # 1. Load the base visible to this teacher: their own entries plus
-        #    those of colleagues in their groups. Loaded even with
-        #    use_memory=False – step 8 appends to it.
-        store = load_store(teams.visible_owners(owner))
+        # 1. Snapshot the fingerprint base visible to this teacher.
         if use_memory:
+            store = load_store(teams.visible_owners(owner))
             _update(job_id, progress=5, step=f'База загружена: {len(store)} записей')
         else:
+            store = {}
             _update(job_id, progress=5, step='Сравнение с базой отключено')
 
         # 2. Extract
@@ -2421,27 +2419,11 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
                   f'Проверка ГОСТ 7.32-2017: {i+1} из {n}…')
             r['gost_results'] = check_gost(r, enabled_checks)
 
-        # 4. Build historical list, excluding recognized students in this batch.
-        #    Without this, a student's new report would match their own stored
-        #    fingerprint from a previous session (false "self-plagiarism").
-        #    Отбор идёт по «фио|группа», а не по ключу записи: в общей базе
-        #    группы преподавателей ту же работу мог сохранить коллега, под
-        #    своим владельцем, и по ключу она бы не отсеялась – пересдача у
-        #    другого преподавателя показывалась бы как стопроцентное
-        #    заимствование у самого себя. Для работы без ФИО и группы точечное
-        #    исключение той же версии делается сравнителями по имени файла и
-        #    отпечатку нормализованного текста: остальные анонимные работы
-        #    должны остаться в сравнении.
-        new_students = {sid for r in reports
-                        if (sid := student_id(r.get('student', {}))) != NO_STUDENT}
+        # 4. Both detectors exclude self-comparisons per pair. A submission
+        # by one student can still match another student's work in this batch.
+        historical = [to_virtual_report(k, v) for k, v in store.items()]
         if use_memory:
-            historical = [
-                to_virtual_report(k, v) for k, v in store.items()
-                if student_id(v.get('student', {})) not in new_students
-            ]
-            _update(job_id, step=f'Сравниваем с базой: {len(historical)} чужих отчётов')
-        else:
-            historical = []
+            _update(job_id, step=f'Сравниваем с базой: {len(historical)} записей')
 
         # 5. Text plagiarism (new + relevant historical)
         _stop_point(job_id)

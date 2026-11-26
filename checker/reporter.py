@@ -261,7 +261,7 @@ def _max_sim(path: str, matrix: dict) -> tuple:
     row = matrix.get(path, {})
     best_sim, best_path = 0.0, None
     for other_path, sim in row.items():
-        if other_path != path and sim > best_sim:
+        if other_path != path and (best_path is None or sim > best_sim):
             best_sim, best_path = sim, other_path
     return best_sim, best_path
 
@@ -274,7 +274,7 @@ def _render_matrix(new_reports: list, historical_relevant: list,
     if not matrix or len(all_reports) < 2:
         return '<p style="color:var(--muted-soft)">Недостаточно отчётов для матрицы.</p>'
 
-    threshold_pct = int(threshold * 100)
+    threshold_pct = grading.as_percent(threshold)
     hist_paths = {r['path'] for r in historical_relevant}
     report_by_path = {r['path']: r for r in all_reports}
     paths = [r['path'] for r in all_reports]
@@ -327,9 +327,11 @@ def _render_matrix(new_reports: list, historical_relevant: list,
                 # Ноль здесь означал бы «проверено, чисто» – это неправда.
                 cells.append('<td class="mc" style="background:var(--info-soft);'
                              'color:var(--info);" title="текст не извлечён">–</td>')
+            elif p2 not in matrix.get(p1, {}):
+                cells.append('<td class="mc cell-self" title="пара не сравнивалась">–</td>')
             else:
-                sim = matrix.get(p1, {}).get(p2, 0.0)
-                pct = int(sim * 100)
+                sim = matrix[p1][p2]
+                pct = grading.similarity_percent(sim, threshold)
                 style = _cell_inline_style(sim, threshold)
                 txt = f'{pct}%' if show_pct else f'{pct}'
                 cells.append(f'<td class="mc matrix-cell" style="{style}">{txt}</td>')
@@ -366,7 +368,7 @@ def _render_matrix(new_reports: list, historical_relevant: list,
 </div>
 <p style="font-size:var(--text-13);color:var(--muted-soft);margin-top:var(--space-2);">
   <span style="display:inline-block;width:14px;height:14px;background:var(--danger);border-radius:var(--radius-sm);vertical-align:middle;"></span> ≥{threshold_pct}% – заимствование &nbsp;
-  <span style="display:inline-block;width:14px;height:14px;background:var(--attention);border-radius:var(--radius-sm);vertical-align:middle;"></span> {int(threshold_pct*0.55)}–{threshold_pct}% – близко &nbsp;
+  <span style="display:inline-block;width:14px;height:14px;background:var(--attention);border-radius:var(--radius-sm);vertical-align:middle;"></span> {grading.similarity_percent(threshold * 0.55, threshold)}–{threshold_pct}% – близко &nbsp;
   {'<span style="display:inline-block;width:14px;height:14px;background:var(--info-soft);border:1px solid var(--info);border-radius:var(--radius-sm);vertical-align:middle;"></span> «–» – текст не извлечён, сравнение невозможно &nbsp;' if no_text else ''}
   {hist_note}
 </p>'''
@@ -560,7 +562,7 @@ def _render_text_plag_for_report(path: str, text_plagiarism: dict, threshold: fl
     if max_sim < threshold * 0.3:
         return (
             '<p style="color:var(--success);font-weight:600;font-size:var(--text-14);">'
-            f'✓ Заимствования не обнаружено (макс. схожесть {max_sim:.0%})</p>'
+            f'✓ Заимствования не обнаружено (макс. схожесть {grading.similarity_percent(max_sim, threshold)}%)</p>'
         )
 
     parts = []
@@ -609,14 +611,14 @@ def _render_text_plag_for_report(path: str, text_plagiarism: dict, threshold: fl
         parts.append(
             f'<div class="plagiarism-alert{alert_cls}" style="margin-bottom:var(--space-2);">'
             f'<span class="badge {badge_cls}">{label}</span> '
-            f'<strong>{sim:.0%}</strong> совпадений с '
+            f'<strong>{grading.similarity_percent(sim, threshold)}%</strong> совпадений с '
             f'{ref_html}'
             f'{passages_html}</div>'
         )
 
     return ''.join(parts) if parts else (
         '<p style="color:var(--attention);font-size:var(--text-14);">'
-        f'Схожесть до {max_sim:.0%}, ниже порога {threshold:.0%}</p>'
+        f'Схожесть до {grading.similarity_percent(max_sim, threshold)}%, ниже порога {grading.as_percent(threshold)}%</p>'
     )
 
 
@@ -697,7 +699,7 @@ def _render_img_plag_for_report(path: str, image_plagiarism: dict,
             + ''.join(items))
 
 
-def _render_feedback(report: dict, gost_results: list, max_sim: float,
+def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: bool,
                      threshold: float, weights: dict, scale: int,
                      no_text: bool = False) -> str:
     """Рекомендуемая оценка и готовый к копированию отзыв для одной работы."""
@@ -706,11 +708,12 @@ def _render_feedback(report: dict, gost_results: list, max_sim: float,
         'fio':     _display_name(report),
         'group':   (report.get('student') or {}).get('group', ''),
         'flaws':   grading.flaws(gost_results),
-        'plag':    None if no_text else round(max_sim * 100),
+        'plag':    None if no_text else plag_pct,
+        'plag_flagged': has_text_plag,
         'no_text': no_text,
         'grade':   mark,
     }
-    thr_pct = int(threshold * 100)
+    thr_pct = grading.as_percent(threshold)
     lines = grading.feedback_lines(student, thr_pct)
     plain = grading.feedback_text(student, thr_pct)
 
@@ -761,10 +764,11 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
     score_pct = int(passed / total * 100) if total else 0
 
     matrix = text_plagiarism.get('matrix', {})
-    max_sim, _ = _max_sim(path, matrix)
+    max_sim, other = _max_sim(path, matrix)
+    plag_pct = grading.similarity_percent(max_sim, threshold)
     no_text = path in set(text_plagiarism.get('no_text') or ())
 
-    has_text_plag = max_sim >= threshold and not no_text
+    has_text_plag = other is not None and max_sim >= threshold and not no_text
     has_img_plag  = any(
         (p['report1'] == path or p['report2'] == path) and not p.get('ui_review')
         for p in image_plagiarism.get('pairs', [])
@@ -829,7 +833,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
     <span style="font-size:var(--text-16);font-weight:600;flex:1;">{_esc(_display_name(report))}</span>
     {badge}
     <span style="font-size:var(--text-13);color:var(--muted);white-space:nowrap;">
-      ГОСТ: {passed}/{total} &nbsp;|&nbsp; Схожесть: {'–' if no_text else f'{max_sim:.0%}'}
+      ГОСТ: {passed}/{total} &nbsp;|&nbsp; Схожесть: {'–' if no_text else f'{plag_pct}%'}
     </span>
     <span class="toggle-arrow">▼</span>
   </div>
@@ -838,7 +842,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
     {f'<p style="color:var(--muted);font-size:var(--text-13);margin-bottom:var(--space-2);">{meta}</p>' if meta else ''}
     <p style="font-size:var(--text-12);color:var(--muted-soft);margin-bottom:var(--space-4);">📄 {fname_disp}</p>
 
-    {_render_feedback(report, gost_results, max_sim, threshold, weights, scale, no_text)}
+    {_render_feedback(report, gost_results, plag_pct, has_text_plag, threshold, weights, scale, no_text)}
 
     <div class="grid-2">
       <!-- GOST -->
@@ -887,7 +891,7 @@ def generate_html_report(reports: list, historical: list,
     """
     now      = datetime.now().strftime('%d.%m.%Y %H:%M')
     n        = len(reports)
-    thr_pct  = int(threshold * 100)
+    thr_pct  = grading.as_percent(threshold)
     page_title = _page_title(reports, now)
     anchors = _report_anchors(reports, job_id)
 
@@ -913,8 +917,8 @@ def generate_html_report(reports: list, historical: list,
         return False
 
     historical_relevant = [h for h in historical if _hist_has_match(h)]
-    all_reports = reports + historical_relevant
-    report_by_path = {r['path']: r for r in all_reports}
+    # Even a score below the matrix display cutoff can be a work's best match.
+    report_by_path = {r['path']: r for r in reports + historical}
 
 
     flagged_text = len({
@@ -967,8 +971,8 @@ def generate_html_report(reports: list, historical: list,
 
     def _row_class(r):
         path = r['path']
-        sim, _ = _max_sim(path, matrix)
-        has_plag = (sim >= threshold and path not in no_text_paths) or any(
+        sim, other = _max_sim(path, matrix)
+        has_plag = (other is not None and sim >= threshold and path not in no_text_paths) or any(
             p['report1'] == path or p['report2'] == path for p in img_confirmed
         )
         p, t = _gost_score(r.get('gost_results', []))
@@ -982,7 +986,7 @@ def generate_html_report(reports: list, historical: list,
         sim, sim_other = _max_sim(path, matrix)
         row_no_text = path in no_text_paths
 
-        other_rep = report_by_path.get(sim_other) if sim_other else None
+        other_rep = report_by_path.get(sim_other) if sim > 0 or threshold == 0 else None
         if other_rep and other_rep.get('is_historical'):
             v = other_rep.get('historical_version', '?')
             d = other_rep.get('historical_date', '')
@@ -1011,10 +1015,10 @@ def generate_html_report(reports: list, historical: list,
         if row_no_text:
             plag_badge = '<span class="badge badge-blue">текст не извлечён</span>'
             other_name_html = 'сравнение не проводилось'
-        elif sim >= threshold:
-            plag_badge = f'<span class="badge badge-red">{sim:.0%}</span>'
+        elif sim_other is not None and sim >= threshold:
+            plag_badge = f'<span class="badge badge-red">{grading.similarity_percent(sim, threshold)}%</span>'
         else:
-            plag_badge = f'<span style="color:var(--muted);">{sim:.0%}</span>'
+            plag_badge = f'<span style="color:var(--muted);">{grading.similarity_percent(sim, threshold)}%</span>'
         if not t:
             gost_badge = '<span class="badge badge-blue">не проверялся</span>'
         elif p == t:
@@ -1631,7 +1635,7 @@ a:focus-visible { border-radius: 2px; }
   </div>
   <div class="stat-card {'c-red' if flagged_text else 'c-green'}">
     <div class="stat-num">{flagged_text}</div>
-    <div class="stat-lbl">С заимствованием текста (&gt;{thr_pct}%)</div>
+    <div class="stat-lbl">С заимствованием текста (≥{thr_pct}%)</div>
   </div>
   <div class="stat-card {'c-red' if flagged_img else 'c-green'}">
     <div class="stat-num">{flagged_img}</div>
@@ -1651,7 +1655,7 @@ a:focus-visible { border-radius: 2px; }
 <div class="section">
   <h2>Матрица схожести текстов</h2>
   <p class="subtitle" style="margin-bottom:var(--space-3);">
-    Доля 5-грамм слов меньшей работы, найденных в другой. Красный – выше порога {thr_pct}%, жёлтый – {int(thr_pct*0.55)}–{thr_pct}%.
+    Доля 5-грамм слов меньшей работы, найденных в другой. Красный – от {thr_pct}%, жёлтый – {grading.similarity_percent(threshold * 0.55, threshold)}–{thr_pct}%.
     {'Включены совпадения с предыдущими сессиями (выделены желтоватым фоном).' if historical_relevant else ''}
   </p>
   {matrix_html}

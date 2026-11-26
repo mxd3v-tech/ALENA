@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import imagehash
+import pymupdf
+from PIL import Image
 
 from checker import accounts, db, job_store, memory_store, sqlmigrate, teams
 from checker.image_plagiarism import check_image_plagiarism
@@ -439,6 +441,57 @@ class ReportStorageIntegrityTests(unittest.TestCase):
         with patch.object(web, '_report_owners', return_value=owners):
             web._finish_report_cleanup(stage)
         self.assertFalse(orphan.exists())
+
+
+class BatchHistoryTests(unittest.TestCase):
+    def test_archive_copy_is_detected_when_its_author_is_in_the_batch(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(db, 'DB_ENABLED', False))
+        self.enterContext(patch.object(accounts, 'USERS_PATH', root / 'users.json'))
+        self.enterContext(patch.object(memory_store, 'STORE_PATH', root / 'store.json'))
+        self.enterContext(patch.object(job_store, 'STORE_DIR', root / 'jobs'))
+        self.enterContext(patch.object(job_store, 'STORE_PATH', root / 'jobs.json'))
+        self.enterContext(patch.object(web, 'REPORTS_DIR', root))
+        self.enterContext(patch.object(teams, 'visible_owners', return_value=['teacher']))
+        self.enterContext(patch.object(web, 'jobs', {}))
+
+        def pdf(prefix, picture=False):
+            with pymupdf.open() as doc:
+                page = doc.new_page()
+                words = ' '.join(f'{prefix}{i}' for i in range(80))
+                page.insert_textbox((40, 40, 550, 350), words)
+                if picture:
+                    with Image.new('RGB', (100, 100), 'blue') as img, io.BytesIO() as buf:
+                        img.save(buf, format='PNG')
+                        page.insert_image((40, 400, 140, 500), stream=buf.getvalue())
+                return doc.tobytes()
+
+        def process(job_id, files):
+            uploads = root / job_id
+            uploads.mkdir()
+            for name, data in files:
+                (uploads / (name + '.pdf')).write_bytes(data)
+            web.jobs[job_id] = {'status': 'processing', 'owner': 'teacher'}
+            web._process_job(job_id, str(uploads), 0.6, 'teacher')
+            self.assertEqual(web.jobs[job_id]['status'], 'done', web.jobs[job_id].get('error'))
+
+        ivanov = 'Иванов Иван Иванович'
+        petrov = 'Петров Пётр Петрович'
+        original = pdf('original', picture=True)
+        process('abc001', [(ivanov, original)])
+        process('abc002', [(ivanov, pdf('revised')), (petrov, original)])
+
+        with patch.object(accounts, 'user_by_api_key', return_value=_user(use_api=True)):
+            response = web.app.test_client().get('/api/v1/jobs/abc002',
+                                                 headers={'X-API-Key': 'test'})
+        self.assertEqual(response.status_code, 200)
+        job = response.get_json()
+        self.assertEqual((job['text_pairs'], job['img_pairs']), (1, 1))
+        scores = {s['fio']: s['plag'] for s in job['summary']['students']}
+        self.assertEqual(scores, {ivanov: 0, petrov: 100})
+        for match in job['summary']['matches']:
+            self.assertEqual((match['a_fio'], match['b_fio'], match['b_new']),
+                             (petrov, ivanov, False))
 
 
 class AnonymousHistoryTests(unittest.TestCase):

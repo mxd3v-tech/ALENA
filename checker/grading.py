@@ -6,10 +6,26 @@
 по-прежнему проверяется и попадает в отзыв – он просто не двигает оценку.
 """
 
+from decimal import Decimal
+
 from .gost import ALL_CODES, CHECK_NAMES, FLAW_TEXT
 
 DEFAULT_WEIGHT = 100    # изначально все критерии равнозначны
 DEFAULT_SCALE = 100     # 100 – оценка в процентах; иначе шкала в баллах
+
+
+def as_percent(fraction: float) -> int | float:
+    """Keep the configured decimal precision (e.g. 0.29 → 29)."""
+    pct = float(Decimal(str(fraction)) * 100)
+    return int(pct) if pct.is_integer() else pct
+
+
+def similarity_percent(similarity: float, threshold: float) -> int | float:
+    """Compact display, retaining precision if rounding crosses the cutoff."""
+    pct = round(similarity * 100.0, 1)
+    if (similarity > 0 and pct == 0) or (pct / 100 >= threshold) != (similarity >= threshold):
+        return as_percent(similarity)
+    return int(pct) if pct.is_integer() else pct
 
 
 def clean_weights(raw) -> dict:
@@ -120,7 +136,7 @@ def flaws(gost_results: list) -> list:
     return out
 
 
-def feedback_lines(student: dict, threshold_pct: int = None,
+def feedback_lines(student: dict, threshold_pct: float = None,
                    details: bool = False) -> list:
     """Строки готового отзыва по одной записи `students` из summary."""
     if student.get('error'):
@@ -140,13 +156,14 @@ def feedback_lines(student: dict, threshold_pct: int = None,
                      'выводится; нужна ручная проверка')
 
     plag = student.get('plag')
-    if plag is not None and threshold_pct is not None and plag >= threshold_pct:
+    if (plag is not None and threshold_pct is not None
+            and student.get('plag_flagged', plag >= threshold_pct)):
         lines.append(f'Совпадение с другой работой – {plag}% '
                      f'(допустимый порог {threshold_pct}%)')
     return lines
 
 
-def feedback_text(student: dict, threshold_pct: int = None,
+def feedback_text(student: dict, threshold_pct: float = None,
                   details: bool = False, bullet: str = '• ') -> str:
     """Готовый к вставке отзыв: заголовок, перечень замечаний, оценка."""
     lines = feedback_lines(student, threshold_pct, details)
