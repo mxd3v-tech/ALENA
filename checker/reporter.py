@@ -266,19 +266,29 @@ def _max_sim(path: str, matrix: dict) -> tuple:
     return best_sim, best_path
 
 
+# 32 columns still fit the printable A4 width at the minimum cell size.
+MATRIX_MAX_REPORTS = 32
+
+
 def _render_matrix(new_reports: list, historical_relevant: list,
                    text_plagiarism: dict, threshold: float) -> str:
     matrix = text_plagiarism.get('matrix', {})
-    no_text = set(text_plagiarism.get('no_text') or ())
-    all_reports = new_reports + historical_relevant
-    if not matrix or len(all_reports) < 2:
+    n = len(new_reports) + len(historical_relevant)
+    if not matrix or n < 2:
         return '<p style="color:var(--muted-soft)">Недостаточно отчётов для матрицы.</p>'
 
+    if n > MATRIX_MAX_REPORTS:
+        return (f'<p>Матрица для {n} работ превышает предел в {MATRIX_MAX_REPORTS}. '
+                'Максимальное сходство каждой новой работы и его источник приведены '
+                'в <a href="#report-summary">сводной таблице</a>. '
+                'Ближайшие совпадения показаны в карточках работ.</p>')
+
+    all_reports = new_reports + historical_relevant
+    no_text = set(text_plagiarism.get('no_text') or ())
     threshold_pct = grading.as_percent(threshold)
     hist_paths = {r['path'] for r in historical_relevant}
     report_by_path = {r['path']: r for r in all_reports}
     paths = [r['path'] for r in all_reports]
-    n = len(paths)
 
     # Server-side sizing so the matrix always fits the PDF page width.
     # A4 portrait content width ≈ 645px (210mm − 2×20mm margins at 96dpi).
@@ -360,6 +370,9 @@ def _render_matrix(new_reports: list, historical_relevant: list,
         )
 
     return f'''{dims}
+<p class="subtitle" style="margin-bottom:var(--space-3);">
+  Доля 5-грамм слов меньшей работы, найденных в другой.
+</p>
 <div class="matrix-scroll">
 <table class="matrix-table">
   <thead><tr><th class="corner"></th>{headers}</tr></thead>
@@ -1647,17 +1660,13 @@ a:focus-visible { border-radius: 2px; }
   </div>{cross_card}
 </div>
 
-<div class="section summary">
+<div class="section summary" id="report-summary">
   <h2>Сводная таблица</h2>
   <div class="tbl-wrap">{summary_table}</div>
 </div>
 
 <div class="section">
   <h2>Матрица схожести текстов</h2>
-  <p class="subtitle" style="margin-bottom:var(--space-3);">
-    Доля 5-грамм слов меньшей работы, найденных в другой. Красный – от {thr_pct}%, жёлтый – {grading.similarity_percent(threshold * 0.55, threshold)}–{thr_pct}%.
-    {'Включены совпадения с предыдущими сессиями (выделены желтоватым фоном).' if historical_relevant else ''}
-  </p>
   {matrix_html}
 </div>
 

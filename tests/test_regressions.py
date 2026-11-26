@@ -466,19 +466,23 @@ class BatchHistoryTests(unittest.TestCase):
                         page.insert_image((40, 400, 140, 500), stream=buf.getvalue())
                 return doc.tobytes()
 
-        def process(job_id, files):
+        def process(job_id, files, use_memory=True):
             uploads = root / job_id
             uploads.mkdir()
             for name, data in files:
                 (uploads / (name + '.pdf')).write_bytes(data)
             web.jobs[job_id] = {'status': 'processing', 'owner': 'teacher'}
-            web._process_job(job_id, str(uploads), 0.6, 'teacher')
-            self.assertEqual(web.jobs[job_id]['status'], 'done', web.jobs[job_id].get('error'))
+            web._process_job(job_id, str(uploads), 0.6, 'teacher', use_memory=use_memory)
+            self.assertNotIn(job_id, web.jobs)
+            saved = job_store.get(job_id)
+            self.assertEqual(saved['status'], 'done', saved.get('error'))
 
         ivanov = 'Иванов Иван Иванович'
         petrov = 'Петров Пётр Петрович'
         original = pdf('original', picture=True)
-        process('abc001', [(ivanov, original)])
+        with patch.object(memory_store, 'load_store') as read_archive:
+            process('abc001', [(ivanov, original)], use_memory=False)
+            read_archive.assert_not_called()
         process('abc002', [(ivanov, pdf('revised')), (petrov, original)])
 
         with patch.object(accounts, 'user_by_api_key', return_value=_user(use_api=True)):

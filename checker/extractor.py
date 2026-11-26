@@ -7,10 +7,10 @@
 """
 import re
 import io
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pdfplumber
-import pymupdf as fitz
 from PIL import Image
 
 from checker.image_plagiarism import image_meta
@@ -227,6 +227,37 @@ def _content_bounds(page):
             max(ln['bottom'] for ln in content))
 
 
+# PyMuPDF must always run on the same thread, including document cleanup.
+# Other parts of extraction and checking can run concurrently for separate jobs.
+_image_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pymupdf')
+
+
+def _extract_images(pdf_path: str) -> list:
+    import pymupdf
+
+    images = []
+    seen_xrefs = set()
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            for page in doc:
+                for img in page.get_images(full=True):
+                    xref = img[0]
+                    if xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+                    try:
+                        data = doc.extract_image(xref)['image']
+                        with Image.open(io.BytesIO(data)) as original:
+                            if original.width >= 50 and original.height >= 50:
+                                with original.convert('RGB') as rgb:
+                                    images.append({'page': page.number + 1, **image_meta(rgb)})
+                    except Exception:
+                        continue
+    except Exception:
+        pass  # Keep any images already extracted from a partially readable PDF.
+    return images
+
+
 def extract_report(pdf_path: str, filename: str = '', error: str = '') -> dict:
     """Разобрать PDF и собрать по нему report – словарь, с которым дальше
     работают все проверки.
@@ -370,36 +401,7 @@ def extract_report(pdf_path: str, filename: str = '', error: str = '') -> dict:
                                               result['filename'])
         return result
 
-    # Extract images via PyMuPDF
-    try:
-        doc = fitz.open(pdf_path)
-        seen_xrefs: set = set()
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            for img in page.get_images(full=True):
-                xref = img[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-                try:
-                    base_image = doc.extract_image(xref)
-                    pil_img = Image.open(io.BytesIO(
-                        base_image['image'])).convert('RGB')
-                    if pil_img.width >= 50 and pil_img.height >= 50:
-                        # Hashes/thumbnail now, full image dropped right away:
-                        # keeping thousands of decoded PILs for the whole job
-                        # is what used to OOM the host on large batches.
-                        result['images'].append({
-                            'page': page_num + 1,
-                            **image_meta(pil_img),
-                        })
-                    pil_img.close()
-                except Exception:
-                    pass
-        doc.close()
-    except Exception:
-        pass
-
+    result['images'] = _image_worker.submit(_extract_images, pdf_path).result()
     result['student'] = _identify_student(result['text_by_page'],
                                           result['filename'])
     return result

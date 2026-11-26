@@ -92,7 +92,7 @@ Start a check. `multipart/form-data`:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `files` | file(s) | One or more `.pdf`, `.docx`, `.odt` or `.doc` files, or a `.zip` of them. Repeat the field for several files. DOCX, ODT and DOC are converted to PDF on the server before checking, so the criteria apply to every format identically; a file that cannot be converted is reported as a card with an error and the rest of the batch is checked as usual. The request body must stay under 600 MB – split a larger batch into several checks. (The web interface has no such limit: it uploads in chunks, up to `AU_MAX_UPLOAD_MB`.) |
+| `files` | file(s) | One or more `.pdf`, `.docx`, `.odt` or `.doc` files, or a `.zip` of them. Repeat the field for several files. DOCX, ODT and DOC are converted to PDF on the server before checking, so the criteria apply to every format identically; a file that cannot be converted is reported as a card with an error and the rest of the batch is checked as usual. The combined file size must fit `AU_MAX_UPLOAD_MB` (default 5120 MiB). The complete multipart request also has a 600 MiB limit. The web interface can upload larger batches in chunks within the configured batch limit. |
 | `threshold` | float | Text-similarity threshold, `0.0`-`1.0` (default `0.6`). Values outside the range are clamped to it; anything unparsable (`abc`, `NaN`, `inf`, empty) falls back to the default instead of failing the request. |
 | `gost` | string | Optional comma-separated GOST check codes to evaluate, e.g. `S1,S3,F7,F9`. Omit the field to run all 22 checks; an empty value runs none. Codes: `S1`-`S9` plus `S5A` (structural elements), `F1`-`F12` (formatting). |
 | `use_memory` | string | Optional. `0`/`false` skips plagiarism comparison against the stored fingerprint base (only files within the batch are compared). New reports are still added to the base. Default `1`. |
@@ -114,6 +114,7 @@ Start a check. `multipart/form-data`:
 ```
 
 `400` when no files are supplied or no report is found inside the upload.
+`413` when the files exceed the configured batch limit or the multipart body exceeds the request limit.
 
 ### GET `/jobs`
 List the jobs visible to the caller, keyed by `job_id`:
@@ -216,10 +217,11 @@ check when there is one, otherwise from stored history – so a restart does not
 lose it. `404` when the id is unknown or malformed.
 
 ### POST `/jobs/<job_id>/cancel`
-Stop a running check. The worker notices at its next progress step, deletes the
-uploaded files and settles on `status: "cancelled"`: no report is written and no
-fingerprints reach the base. A check that has already started writing its report
-finishes – that tail takes seconds. `409` when the check is no longer running.
+Request cancellation of a running check, including during HTML generation. A
+successful response means the worker will discard the report and fingerprints,
+remove the uploaded files and finish with `status: "cancelled"`. Publication and
+cancellation are serialized. If publication finishes first, the server returns
+`409` and the saved result is available.
 
 ```json
 { "ok": true }

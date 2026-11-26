@@ -7,8 +7,11 @@
 """
 
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pymupdf as fitz
 
@@ -200,6 +203,29 @@ class PdfRoundTripTests(unittest.TestCase):
     def setUp(self):
         self.report = extractor.extract_report(
             self.path, filename='Иванов Иван Иванович.pdf')
+
+    def test_parallel_jobs_use_one_thread_for_pymupdf(self):
+        start = threading.Barrier(2, timeout=5)
+        callers, image_threads = set(), []
+        open_pdf = fitz.open
+
+        def track_open(*args, **kwargs):
+            image_threads.append(threading.get_ident())
+            return open_pdf(*args, **kwargs)
+
+        def check():
+            callers.add(threading.get_ident())
+            start.wait()
+            return extractor.extract_report(self.path)
+
+        with patch.object(fitz, 'open', side_effect=track_open), ThreadPoolExecutor(2) as jobs:
+            futures = [jobs.submit(check) for _ in range(2)]
+            for future in futures:
+                self.assertEqual(future.result(timeout=10)['pages_count'], 2)
+        self.assertEqual(len(callers), 2)
+        self.assertEqual(len(image_threads), 2)
+        self.assertEqual(len(set(image_threads)), 1)
+        self.assertTrue(callers.isdisjoint(image_threads))
 
     def test_every_page_is_read(self):
         self.assertEqual(self.report['pages_count'], 2)

@@ -137,6 +137,19 @@ def _owners_unlocked() -> dict:
     return owners
 
 
+def create(job_id: str, data: dict) -> bool:
+    """Reserve an unused id without changing an earlier job's record."""
+    path = _job_path(job_id)
+    if db.DB_ENABLED:
+        return db.jobs_create(job_id, data)
+    with _lock, _process_lock():
+        _migrate_legacy_unlocked()
+        if path.exists():
+            return False
+        jsonstore.write_json(path, data)
+        return True
+
+
 def save(job_id: str, data: dict) -> None:
     path = _job_path(job_id)
     if db.DB_ENABLED:

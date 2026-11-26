@@ -38,8 +38,13 @@ class CleanWeightsTests(unittest.TestCase):
             grading.clean_weights({'S1': 40, 'XX': 40, 'F2': 'много'}),
             {'S1': 40})
 
+    def test_overflow_drops_only_the_invalid_weight(self):
+        for value in ('1e999', '-inf', 10 ** 500):
+            with self.subTest(value=value):
+                self.assertEqual(grading.clean_weights({'S1': value, 'S2': 50}), {'S2': 50})
+
     def test_empty_input_gives_empty_weights(self):
-        for value in (None, '', {}, []):
+        for value in (None, '', {}, [], [1]):
             self.assertEqual(grading.clean_weights(value), {})
 
 
@@ -52,7 +57,7 @@ class CleanScaleTests(unittest.TestCase):
             self.assertEqual(grading.clean_scale(value), grading.DEFAULT_SCALE)
 
     def test_falls_back_to_percent_on_junk(self):
-        for value in (None, '', 'пять'):
+        for value in (None, '', 'пять', '1e999', '-inf', 10 ** 500):
             self.assertEqual(grading.clean_scale(value), grading.DEFAULT_SCALE)
 
 

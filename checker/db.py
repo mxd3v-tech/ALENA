@@ -286,6 +286,16 @@ def fp_delete(entry_key: str) -> bool:
 
 # Job history
 
+def jobs_create(job_id: str, data: dict) -> bool:
+    from psycopg.types.json import Json
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO jobs (job_id, data) VALUES (%s, %s) ON CONFLICT (job_id) DO NOTHING",
+            (job_id, Json(data)),
+        )
+        return cur.rowcount == 1
+
+
 def jobs_save(job_id: str, data: dict) -> None:
     from psycopg.types.json import Json
     with _conn() as conn, conn.cursor() as cur:

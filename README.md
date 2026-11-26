@@ -41,7 +41,7 @@
 
 | | Проверка | Как устроено |
 |---|---|---|
-| 📝 | **Заимствование текста** | Шинглы из 5-грамм слов: доля текста меньшей работы, найденная в другой, – переписанная в отчёт методичка не тонет в скриншотах и самостоятельной части. Порог настраивается. В отчёте – матрица совпадений и дословные общие фрагменты |
+| 📝 | **Заимствование текста** | Шинглы из 5-грамм слов: доля текста меньшей работы, найденная в другой, – переписанная в отчёт методичка не тонет в скриншотах и самостоятельной части. Порог настраивается. Отчёт показывает максимальное сходство каждой работы и дословные общие фрагменты. Для набора до 32 работ включительно, считая подходящие работы из базы, он также выводит попарную матрицу |
 | 🖼 | **Дублирование изображений** | Перцептуальный хеш pHash 12×12 (144 бита) в трёх масштабах кадрирования – обрезанный по краям скриншот всё равно опознаётся |
 | 📐 | **ГОСТ 7.32-2017** | 22 критерия: 10 структурных и 12 по оформлению – от полей страницы до подписей рисунков |
 | 🎓 | **Рекомендуемая оценка** | Веса критериев нормируются к 100; готовый отзыв студенту формулируется словами замечания, а не пунктами стандарта |
@@ -164,7 +164,7 @@ gunicorn --workers=1 --threads=8 --timeout=300 -b 0.0.0.0:5000 app:app
 | `AU_HTTPS` | `1` за HTTPS: cookie сессии помечается `Secure` |
 | `AU_TRUSTED_PROXY_COUNT` | Число доверенных reverse proxy для определения IP клиента (по умолчанию `0`) |
 | `DATABASE_URL` | PostgreSQL. Пусто: JSON-хранилище в `memory/` |
-| `AU_MAX_UPLOAD_MB` | Предел одной партии, МБ (по умолчанию 5120) |
+| `AU_MAX_UPLOAD_MB` | Предел объёма загружаемой партии, МиБ (по умолчанию 5120). До 5000 документов на партию. Их суммарный размер с учётом распаковки всех ZIP ограничен удвоенным значением этого параметра |
 | `AU_TMP_DIR` | Где разворачиваются загрузки. Проверьте, что это диск, а не tmpfs – иначе многогигабайтная партия пишется в RAM |
 | `AU_SOFFICE` | Путь к LibreOffice, если он вне `PATH` |
 | `PORT` | Порт веб-интерфейса (по умолчанию 5000) |
@@ -464,7 +464,7 @@ submitted in September is recognised in December.
 
 | | Check | How it works |
 |---|---|---|
-| 📝 | **Text borrowing** | 5-gram word shingles scored as the share of the smaller work found in the other – a manual pasted into a report is not diluted by screenshots and the student's own part. Configurable threshold. The report shows a match matrix and the verbatim shared passages |
+| 📝 | **Text borrowing** | 5-gram word shingles scored as the share of the smaller work found in the other – a manual pasted into a report is not diluted by screenshots and the student's own part. Configurable threshold. The report shows the highest similarity for each work and the verbatim shared passages. It also includes a pairwise matrix for up to 32 works including relevant archive entries |
 | 🖼 | **Duplicated images** | 12×12 perceptual hash (144-bit) at three crop scales – a screenshot trimmed at the edges is still recognised |
 | 📐 | **GOST 7.32-2017** | 22 criteria: 10 structural and 12 formatting – from page margins to figure captions |
 | 🎓 | **Recommended grade** | Per-criterion weights normalised to 100; the student-facing feedback is phrased as a remark, not as a clause number |
@@ -588,7 +588,7 @@ Everything is an environment variable; the full annotated list is in
 | `AU_HTTPS` | `1` behind HTTPS: the session cookie is marked `Secure` |
 | `AU_TRUSTED_PROXY_COUNT` | Number of trusted reverse proxies used to resolve the client IP (default `0`) |
 | `DATABASE_URL` | PostgreSQL. Empty: JSON store in `memory/` |
-| `AU_MAX_UPLOAD_MB` | Largest single batch, MB (default 5120) |
+| `AU_MAX_UPLOAD_MB` | Upload limit per batch, MiB (default 5120). A batch may contain up to 5000 documents. Their combined size after unpacking all ZIPs is limited to twice this setting |
 | `AU_TMP_DIR` | Where uploads are staged. Check it is on disk, not tmpfs – otherwise a multi-gigabyte batch is written straight into RAM |
 | `AU_SOFFICE` | Path to LibreOffice if it is outside `PATH` |
 | `PORT` | Web UI port (default 5000) |

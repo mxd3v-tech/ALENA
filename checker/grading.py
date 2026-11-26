@@ -40,13 +40,15 @@ def clean_weights(raw) -> dict:
                 pairs.append((code, value))
         raw = dict(pairs)
     out = {}
-    for code, value in (raw or {}).items():
+    if not isinstance(raw, dict):
+        return out
+    for code, value in raw.items():
         code = str(code).strip().upper()
         if code not in ALL_CODES:
             continue
         try:
             out[code] = max(0, min(100, int(round(float(value)))))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return out
 
@@ -55,7 +57,7 @@ def clean_scale(raw) -> int:
     """Шкала оценки: целое 2…100. Значение вне диапазона → проценты."""
     try:
         scale = int(round(float(raw)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_SCALE
     return scale if 2 <= scale <= 100 else DEFAULT_SCALE
 

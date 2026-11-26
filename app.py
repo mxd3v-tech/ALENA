@@ -1326,7 +1326,7 @@ def _safe_upload_name(raw: str):
     return _fit_name(name)
 
 
-def _unique_name(dest_dir: str, name: str, taken=()) -> str:
+def _unique_name(dest_dir: str, name: str) -> str:
     """Имя, которое ещё не занято в каталоге задания.
 
     Две работы с одинаковым именем файла – обычное дело: выгрузка из Moodle
@@ -1339,7 +1339,7 @@ def _unique_name(dest_dir: str, name: str, taken=()) -> str:
     stem = stem or name
     candidate = name
     n = 1
-    while candidate in taken or os.path.exists(os.path.join(dest_dir, candidate)):
+    while os.path.exists(os.path.join(dest_dir, candidate)):
         n += 1
         candidate = _fit_name(f'{stem}_{n}{ext}')
     return candidate
@@ -1373,39 +1373,43 @@ def _doc_entries(zf: zipfile.ZipFile) -> list:
     return entries
 
 
-def _zip_doc_count(archive: str) -> int:
-    """Сколько работ в архиве. Читается только оглавление – ответ мгновенный,
-    поэтому «в архиве нет работ» видно сразу, а не после долгой распаковки."""
-    with zipfile.ZipFile(archive, 'r') as zf:
-        return len(_doc_entries(zf))
+class _BatchLimitError(ValueError):
+    """The combined document count or unpacked size exceeds a batch limit."""
 
 
-def _extract_zip(archive: str, dest_dir: str, on_file=None) -> None:
-    """Распаковать только работы и только внутрь папки задания.
+def _prepare_batch(tmp_dir: str, *, unpack_for: str = None) -> int:
+    """Count loose and archived documents. In the worker, also unpack them."""
+    inputs = [p for p in Path(tmp_dir).iterdir() if p.is_file()]
+    loose = [p for p in inputs if p.suffix.lower() in DOC_EXTS]
+    archives = sorted(p for p in inputs if p.suffix.lower() == '.zip')
+    count = len(loose)
+    size = sum(p.stat().st_size for p in loose)
 
-    Имена берём по последнему сегменту пути: архив с записью вида
-    `../../etc/passwd` не должен ничего написать за пределами tmp_dir. Заодно
-    ограничиваем число файлов и суммарный размер – распаковка «архива-бомбы»
-    иначе забьёт диск сервера.
+    def check_limits():
+        if count > ZIP_MAX_FILES:
+            raise _BatchLimitError(f'В партии больше {ZIP_MAX_FILES} работ')
+        if size > ZIP_MAX_TOTAL:
+            limit = _mb_text(ZIP_MAX_TOTAL // (1024 * 1024))
+            raise _BatchLimitError(f'Объём работ после распаковки превышает {limit}')
 
-    on_file(готово, всего) вызывается после каждого файла: распаковка сотни
-    работ занимает заметное время, и о ней надо отчитываться.
-    """
-    total = 0
-    written = 0
-    with zipfile.ZipFile(archive, 'r') as zf:
-        planned = _doc_entries(zf)
-        for info in planned:
-            total += info.file_size
-            written += 1
-            if written > ZIP_MAX_FILES or total > ZIP_MAX_TOTAL:
-                raise ValueError('архив слишком большой для распаковки')
-            name = _safe_upload_name(_zip_name(info))
-            target = Path(dest_dir) / _unique_name(dest_dir, name)
-            with zf.open(info) as src, open(target, 'wb') as out:
-                shutil.copyfileobj(src, out, 1024 * 256)
-            if on_file is not None:
-                on_file(written, len(planned))
+    check_limits()
+    for k, archive in enumerate(archives):
+        with zipfile.ZipFile(archive) as zf:
+            entries = _doc_entries(zf)
+            count += len(entries)
+            size += sum(info.file_size for info in entries)
+            check_limits()
+            if unpack_for is None:
+                continue
+            for i, info in enumerate(entries, 1):
+                name = _safe_upload_name(_zip_name(info))
+                target = Path(tmp_dir) / _unique_name(tmp_dir, name)
+                with zf.open(info) as src, target.open('xb') as out:
+                    shutil.copyfileobj(src, out, 256 * 1024)
+                _tick(unpack_for, 0, 2, round((k + i / len(entries)) * 100),
+                      len(archives) * 100, f'Распаковка {archive.name[:50]}: {i} из {len(entries)}…')
+        archive.unlink()
+    return count
 
 
 def _parse_use_memory(raw) -> bool:
@@ -1415,54 +1419,76 @@ def _parse_use_memory(raw) -> bool:
     return raw.strip().lower() not in ('0', 'false', 'no', 'off')
 
 
-def _upload_slot(upload_id):
-    """Открытая загрузка по её номеру.
-
-    Номер выдан сервером и привязан к учётной записи: чужую партию не дополнить
-    и не запустить, даже зная номер.
-
-    Returns (slot, error_message, http_status).
-    """
-    with uploads_lock:
-        slot = uploads.get(upload_id or '')
+def _with_upload(view):
+    """Serialize part, finish and cancel for one owner's upload."""
+    @wraps(view)
+    def guarded():
+        uid = request.form.get('upload_id')
+        missing = 'Загрузка не найдена или устарела – начните заново'
+        with uploads_lock:
+            slot = uploads.get(uid)
         if slot is None:
-            return None, 'Загрузка не найдена или устарела – начните заново', 404
+            return jsonify({'error': missing}), 404
         if slot['owner'] != g.user['login']:
-            return None, 'Загрузка принадлежит другой учётной записи', 403
-        return slot, None, 200
+            return jsonify({'error': 'Загрузка принадлежит другой учётной записи'}), 403
+        with slot['lock']:
+            # A previous request may have closed or expired it while we waited.
+            with uploads_lock:
+                if uploads.get(uid) is not slot:
+                    return jsonify({'error': missing}), 404
+            slot['at'] = time.monotonic()
+            return view(uid, slot)
+    return guarded
 
 
 def _sweep_uploads():
-    """Убрать брошенные загрузки: вкладку закрыли, связь оборвалась.
-
-    Иначе принятые куски навсегда остаются во временном каталоге сервера.
-    """
+    """Remove expired slots. An in-flight part keeps its directory until it finishes."""
     now = time.monotonic()
     stale = []
     with uploads_lock:
         for uid, slot in list(uploads.items()):
-            if now - slot['at'] > UPLOAD_TTL:
-                stale.append(uploads.pop(uid))
+            if not slot['lock'].acquire(blocking=False):
+                continue
+            try:
+                if now - slot['at'] > UPLOAD_TTL:
+                    stale.append(uploads.pop(uid))
+            finally:
+                slot['lock'].release()
     for slot in stale:
         shutil.rmtree(slot['dir'], ignore_errors=True)
+
+
+def _uploaded_size(file):
+    # Werkzeug spools multipart files into seekable streams before dispatch.
+    size = file.stream.seek(0, os.SEEK_END)
+    file.stream.seek(0)
+    return size
+
+
+def _upload_limit_message():
+    return f'Объём партии больше допустимых {UPLOAD_MAX_MB} МБ'
 
 
 def _start_job(uploaded, threshold: float, owner, enabled_checks=None,
                use_memory=True, weights=None, scale=grading.DEFAULT_SCALE):
     """Принять файлы одним запросом и запустить проверку.
 
-    Так работают API и старые клиенты: объём такой загрузки ограничен пределом
-    одного запроса. Интерфейс шлёт партию кусками – см. /upload/part.
+    Лимит партии считается по принятым файлам без заголовков multipart.
     """
     if not uploaded or all(f.filename == '' for f in uploaded):
         return None, 'Файлы не выбраны', 400
 
     tmp_dir = tempfile.mkdtemp(prefix=TMP_PREFIX_JOB, dir=TMP_ROOT)
+    total = 0
     try:
         for f in uploaded:
             name = _safe_upload_name(f.filename)
             if name is None:
                 continue
+            total += _uploaded_size(f)
+            if total > UPLOAD_MAX_TOTAL:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None, _upload_limit_message(), 413
             # Имя разводится, а не перезаписывается: два файла с одинаковым
             # basename – это две разные работы, а не одна.
             f.save(os.path.join(tmp_dir, _unique_name(tmp_dir, name)))
@@ -1491,16 +1517,11 @@ def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
     фоновом потоке. Иначе на большой партии браузер минутами ждал ответа, не
     зная ни числа работ, ни того, что происходит.
     """
-    job_id = uuid.uuid4().hex[:10]
-    expected = 0
     try:
-        for item in sorted(Path(tmp_dir).iterdir()):
-            if not item.is_file():
-                continue
-            # Оглавление архива читается мгновенно: число работ известно сразу,
-            # а сама распаковка – уже в потоке проверки.
-            expected += (_zip_doc_count(str(item))
-                         if item.name.lower().endswith('.zip') else 1)
+        expected = _prepare_batch(tmp_dir)
+    except _BatchLimitError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None, str(e), 413
     except zipfile.BadZipFile:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None, 'Архив повреждён или это не ZIP', 400
@@ -1513,35 +1534,48 @@ def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
         return None, 'Работы не найдены в загруженных данных ' \
                      '(принимаются PDF, DOCX, ODT, DOC)', 400
 
-    with jobs_lock:
-        jobs[job_id] = {
-            'status':     'processing',
-            'progress':   0,
-            'step':       f'Файлы приняты: {expected} шт. Подготовка…',
-            'total':      expected,
-            'done_files': 0,
-            'text_pairs': 0,
-            'img_pairs':  0,
-            'created_at': datetime.now().strftime('%d.%m.%Y %H:%M'),
-            'beat':       time.time(),
-            'owner':      owner['login'],
-            'owner_fio':  owner.get('fio', owner['login']),
-            'threshold':  grading.as_percent(threshold),
-            'summary':    None,
-            'report_html': None,
-            'error':      None,
-        }
-        snapshot = _public_job(jobs[job_id])
-
-    job_store.save(job_id, snapshot)
-
-    threading.Thread(
-        target=_process_job,
-        args=(job_id, tmp_dir, threshold, owner['login'],
-              enabled_checks, use_memory, weights or {},
-              grading.clean_scale(scale)),
-        daemon=True,
-    ).start()
+    job = {
+        'status':     'processing',
+        'progress':   0,
+        'step':       f'Файлы приняты: {expected} шт. Подготовка…',
+        'total':      expected,
+        'done_files': 0,
+        'text_pairs': 0,
+        'img_pairs':  0,
+        'created_at': datetime.now().strftime('%d.%m.%Y %H:%M'),
+        'beat':       time.time(),
+        'owner':      owner['login'],
+        'owner_fio':  owner.get('fio', owner['login']),
+        'threshold':  grading.as_percent(threshold),
+        'summary':    None,
+        'error':      None,
+    }
+    try:
+        with jobs_lock:
+            for _ in range(8):
+                job_id = uuid.uuid4().hex
+                if job_id in jobs or (REPORTS_DIR / f'{job_id}.html').exists():
+                    continue
+                if job_store.create(job_id, job):
+                    break
+            else:
+                raise RuntimeError('Не удалось выделить номер проверки')
+            jobs[job_id] = job
+            try:
+                threading.Thread(
+                    target=_process_job,
+                    args=(job_id, tmp_dir, threshold, owner['login'],
+                          enabled_checks, use_memory, weights or {},
+                          grading.clean_scale(scale)),
+                    daemon=True,
+                ).start()
+            except Exception:
+                del jobs[job_id]
+                job_store.delete(job_id)
+                raise
+    except Exception as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None, _error_text(exc, 'Запуск проверки'), 500
 
     return job_id, None, 200
 
@@ -1679,15 +1713,15 @@ def _cancel_job(job_id: str):
 
     with jobs_lock:
         live = jobs.get(job_id)
-        if live is not None:
-            live['_cancel'] = True
-    if live is None:
-        # Отметка свежая, а потока в этом процессе нет: проверку ведёт соседний
-        # процесс, и его память отсюда не достать.
-        return jsonify({'error': 'Проверку ведёт другой процесс сервера – '
-                                 'остановить её отсюда нельзя.'}), 409
-
-    _update(job_id, _force=True, step='Останавливаем проверку…')
+        if live is None:
+            return jsonify({'error': 'Проверка уже завершилась или выполняется '
+                                      'в другом процессе сервера.'}), 409
+        if live.get('status') != 'processing':
+            return jsonify({'error': 'Проверка уже завершена – прерывать нечего.'}), 409
+        if not _owns_job(live, g.user):
+            return _deny('Эта проверка принадлежит другому преподавателю.')
+        live['_cancel'] = True
+        live['step'] = 'Останавливаем проверку…'
     return jsonify({'ok': True})
 
 
@@ -1762,12 +1796,15 @@ def upload_start():
     досылает файлы кусками.
     """
     _sweep_uploads()
-    upload_id = uuid.uuid4().hex[:16]
     with uploads_lock:
+        upload_id = uuid.uuid4().hex[:16]
+        while upload_id in uploads:
+            upload_id = uuid.uuid4().hex[:16]
         uploads[upload_id] = {
             'dir':   tempfile.mkdtemp(prefix=TMP_PREFIX_UPLOAD, dir=TMP_ROOT),
             'owner': g.user['login'],
             'bytes': 0,
+            'lock':  threading.Lock(),
             'at':    time.monotonic(),
             # ключ файла в партии → имя, под которым он лёг на диск
             'files': {},
@@ -1781,12 +1818,9 @@ def upload_start():
 
 @app.route('/upload/part', methods=['POST'])
 @permission_required('run_checks')
-def upload_part():
-    """Дописать кусок файла в открытую загрузку."""
-    slot, error, code = _upload_slot(request.form.get('upload_id'))
-    if error:
-        return jsonify({'error': error}), code
-
+@_with_upload
+def upload_part(upload_id, slot):
+    """Принять диапазон байтов, сверив ранее записанную часть при повторе."""
     name = _safe_upload_name(request.form.get('name'))
     if name is None:
         return jsonify({'error': f'Принимаются {UPLOAD_EXTS_TEXT}'}), 400
@@ -1799,55 +1833,73 @@ def upload_part():
     # обрыва» – сервер отвечал успехом, а работа терялась. Старые клиенты и
     # прямые вызовы номера не шлют: для них ключ – по-прежнему имя.
     key = (request.form.get('idx') or '').strip() or name
-    with uploads_lock:
-        stored = slot['files'].get(key)
-        if stored is None:
-            stored = _unique_name(slot['dir'], name,
-                                  taken=set(slot['files'].values()))
-            slot['files'][key] = stored
-
-    # Имя уже очищено от пути, поэтому запись остаётся внутри каталога загрузки.
-    dest = os.path.join(slot['dir'], stored)
-    have = os.path.getsize(dest) if os.path.exists(dest) else 0
-    offset = _int_field(request.form, 'offset', have, 0, UPLOAD_MAX_TOTAL)
+    stored = slot['files'].get(key)
+    new_file = stored is None
+    if new_file:
+        stored = _unique_name(slot['dir'], name)
+    dest = Path(slot['dir']) / stored
+    have = 0 if new_file else dest.stat().st_size
+    try:
+        offset = int(request.form.get('offset', have))
+        if offset < 0:
+            raise ValueError
+    except ValueError:
+        return jsonify({'error': 'Некорректное смещение куска'}), 400
     if offset > have:
         return jsonify({'error': 'Кусок пришёл не по порядку – начните заново',
                         'have': have}), 409
-    if offset < have:
-        # Повтор после обрыва: эти байты уже записаны, второй раз не дописываем.
-        return jsonify({'ok': True, 'bytes': slot['bytes'], 'repeat': True})
 
-    data = chunk.read()
-    with uploads_lock:
-        over = slot['bytes'] + len(data) > UPLOAD_MAX_TOTAL
-        if not over:
-            slot['bytes'] += len(data)
-            slot['at'] = time.monotonic()
-    if over:
-        return jsonify({'error': f'Объём партии больше допустимых '
-                                 f'{UPLOAD_MAX_MB} МБ'}), 413
+    size = _uploaded_size(chunk)
+    overlap = min(size, have - offset)
+    added = size - overlap
+    if slot['bytes'] + added > UPLOAD_MAX_TOTAL:
+        return jsonify({'error': _upload_limit_message()}), 413
 
-    with open(dest, 'wb' if offset == 0 else 'ab') as out:
-        out.write(data)
-    return jsonify({'ok': True, 'bytes': slot['bytes']})
+    try:
+        with dest.open('x+b' if new_file else 'r+b') as out:
+            out.seek(offset)
+            remaining = overlap
+            while remaining:
+                block = min(remaining, 256 * 1024)
+                if out.read(block) != chunk.stream.read(block):
+                    return jsonify({'error': 'Повторный кусок отличается от записанного',
+                                    'have': have}), 409
+                remaining -= block
+            if added:
+                shutil.copyfileobj(chunk.stream, out, 256 * 1024)
+        if added and dest.stat().st_size != have + added:
+            raise OSError('Неполная запись куска')
+    except OSError:
+        # Even an error on close can follow a partial write. Restore the last
+        # committed length before another request can append or finish.
+        try:
+            if new_file:
+                dest.unlink(missing_ok=True)
+            else:
+                os.truncate(dest, have)
+        except OSError:
+            with uploads_lock:
+                uploads.pop(upload_id)
+            shutil.rmtree(slot['dir'], ignore_errors=True)
+        return jsonify({'error': 'Не удалось записать кусок загрузки'}), 500
+
+    slot['files'][key] = stored
+    slot['bytes'] += added
+    slot['at'] = time.monotonic()
+    return jsonify({'ok': True, 'bytes': slot['bytes'], 'repeat': not new_file and not added})
 
 
 @app.route('/upload/finish', methods=['POST'])
 @permission_required('run_checks')
-def upload_finish():
+@_with_upload
+def upload_finish(upload_id, slot):
     """Закрыть загрузку и запустить проверку по собранным файлам."""
-    upload_id = request.form.get('upload_id')
-    slot, error, code = _upload_slot(upload_id)
-    if error:
-        return jsonify({'error': error}), code
-
-    with uploads_lock:
-        uploads.pop(upload_id, None)
-
     threshold = _float_field(request.form, 'threshold', 0.6, 0.0, 1.0)
     enabled = _parse_enabled_checks(request.form.get('gost'))
     use_memory = _parse_use_memory(request.form.get('use_memory'))
     weights, scale = _grade_params(request.form)
+    with uploads_lock:
+        del uploads[upload_id]
     job_id, error, status_code = _launch(
         slot['dir'], threshold, g.user, enabled, use_memory, weights, scale)
     if error:
@@ -1857,14 +1909,11 @@ def upload_finish():
 
 @app.route('/upload/cancel', methods=['POST'])
 @permission_required('run_checks')
-def upload_cancel():
+@_with_upload
+def upload_cancel(upload_id, slot):
     """Отменить загрузку – вкладку закрыли или связь оборвалась."""
-    upload_id = request.form.get('upload_id')
-    slot, error, code = _upload_slot(upload_id)
-    if error:
-        return jsonify({'error': error}), code
     with uploads_lock:
-        uploads.pop(upload_id, None)
+        del uploads[upload_id]
     shutil.rmtree(slot['dir'], ignore_errors=True)
     return jsonify({'ok': True})
 
@@ -2178,6 +2227,10 @@ class JobCancelled(Exception):
     """Проверку прервал преподаватель – это не сбой, а решение."""
 
 
+_CANCELLED_STEP = ('Проверка прервана преподавателем. Отчёт и отпечатки '
+                   'не сохранены.')
+
+
 def _update(job_id: str, _force: bool = False, **kwargs):
     """Обновить состояние проверки.
 
@@ -2190,6 +2243,11 @@ def _update(job_id: str, _force: bool = False, **kwargs):
     with jobs_lock:
         job = jobs.get(job_id)
         if job is not None:
+            if job.get('_cancel'):
+                if kwargs.get('status') == 'error':
+                    kwargs = {'status': 'cancelled', 'step': _CANCELLED_STEP}
+                elif 'status' not in kwargs and not _force:
+                    raise JobCancelled
             job.update(kwargs)
             now = time.monotonic()
             if (_force or 'status' in kwargs
@@ -2264,16 +2322,7 @@ def _collect_docs(job_id: str, tmp_dir: str) -> tuple:
     работ распаковка и конвертация занимают минуты, и всё это время браузер не
     получал бы даже номера проверки.
     """
-    archives = sorted(Path(tmp_dir).glob('*.[zZ][iI][pP]'))
-    for k, arc in enumerate(archives):
-        _extract_zip(
-            str(arc), tmp_dir,
-            on_file=lambda done, total, k=k, name=arc.name: _tick(
-                job_id, 0, 2,
-                round((k + done / max(total, 1)) * 100), len(archives) * 100,
-                f'Распаковка {name[:50]}: {done} из {total}…'),
-        )
-        arc.unlink(missing_ok=True)
+    _prepare_batch(tmp_dir, unpack_for=job_id)
 
     # Список составляется до конвертации: её результаты ложатся сюда же, и
     # обход после неё вернул бы каждый переведённый документ вторым разом.
@@ -2357,6 +2406,8 @@ def _publish_job(job_id, owner, html, reports, completed):
             out.write(html)
         with jobs_lock:
             job = jobs[job_id]
+            if job.get('_cancel'):
+                raise JobCancelled
             completed['beat'] = time.time()
             with sqlmigrate.transaction():
                 add_reports(reports, job_id, owner)
@@ -2375,9 +2426,11 @@ def _publish_job(job_id, owner, html, reports, completed):
 def _process_job(job_id: str, tmp_dir: str, threshold: float,
                  owner: str, enabled_checks=None, use_memory=True,
                  weights=None, scale=grading.DEFAULT_SCALE):
+    with jobs_lock:
+        live_job = jobs[job_id]
     stop_beat = threading.Event()
-    threading.Thread(target=_beat, args=(job_id, stop_beat), daemon=True).start()
     try:
+        threading.Thread(target=_beat, args=(job_id, stop_beat), daemon=True).start()
         from checker.memory_store import load_store, to_virtual_report
 
         # 0. Unpack what was uploaded and bring every format to PDF.
@@ -2453,8 +2506,7 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
                            if not p.get('ui_review')])
         _update(job_id, img_pairs=img_flagged)
 
-        # 7. Generate HTML report. Последняя точка остановки: дальше отчёт уже
-        #    собран, и бросать работу за секунду до конца незачем.
+        # 7. Render the report. Publication checks cancellation again under jobs_lock.
         _stop_point(job_id)
         _update(job_id, progress=88, step='Генерация HTML-отчёта…')
         html = generate_html_report(
@@ -2474,11 +2526,7 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
         _publish_job(job_id, owner, html, saveable, completed)
 
     except JobCancelled:
-        # Ни отчёта, ни отпечатков: последняя точка остановки стоит перед седьмым
-        # шагом, а сборка отчёта и запись в базу идут уже без них.
-        _update(job_id, status='cancelled',
-                step='Проверка прервана преподавателем. Отчёт не сформирован, '
-                     'отпечатки в базу не сохранены.')
+        _update(job_id, status='cancelled', step=_CANCELLED_STEP)
 
     except Exception as exc:
         import traceback
@@ -2490,6 +2538,9 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
                 error=traceback.format_exc())
     finally:
         stop_beat.set()
+        with jobs_lock:
+            if jobs.get(job_id) is live_job:
+                del jobs[job_id]
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
