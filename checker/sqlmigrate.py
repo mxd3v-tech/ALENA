@@ -307,7 +307,7 @@ def _validate(table, rec):
     key = _COLUMNS[table][0]
     _require(isinstance(rec.get(key), str) and rec[key], f'{table}.{key}')
     if table == 'jobs':
-        _require(re.fullmatch('[0-9a-f]{6,40}', rec[key]), 'jobs.job_id')
+        _require(job_store.JOB_ID_RE.fullmatch(rec[key]), 'jobs.job_id')
         job = rec.get('data')
         _require(isinstance(job, dict) and job.get('status') in
                  ('done', 'error', 'processing', 'cancelled'), 'jobs.status')

@@ -77,7 +77,7 @@
       <tbody>
         {% for r in recent %}
         <tr>
-          <td>{% if r.has_report %}<a class="mono" href="{{ url_for('report', job_id=r.job_id) }}" target="_blank" rel="noopener">#{{ r.job_id[:6] }}</a>{% else %}<span class="mono">#{{ r.job_id[:6] }}</span> <span class="sub">{{ {'processing': 'Выполняется', 'cancelled': 'Прервана', 'error': 'Ошибка'}.get(r.status, 'Отчёт недоступен') }}</span>{% endif %}</td>
+          <td>{% if r.has_report %}<a class="mono" href="{{ url_for('report', job_id=r.job_id) }}" target="_blank" rel="noopener">#{{ r.job_id[:5] }}</a>{% else %}<span class="mono">#{{ r.job_id[:5] }}</span> <span class="sub">{{ {'processing': 'Выполняется', 'cancelled': 'Прервана', 'error': 'Ошибка'}.get(r.status, 'Отчёт недоступен') }}</span>{% endif %}</td>
           <td>{{ r.summary.groups | join(', ') or '–' if r.summary else '–' }}</td>
           {% if can(user, 'see_all') %}<td>{{ r.owner_fio or '–' }}</td>{% endif %}
           <td class="num">{{ r.total or 0 }}</td>

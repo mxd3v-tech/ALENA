@@ -62,6 +62,7 @@ from checker import (accounts, branding, convert, db, grading, job_store,
                      releases, sqlmigrate, summary as summary_mod, teams)
 from checker.extractor        import extract_report
 from checker.gost             import check_gost, GOST_CHECKS, ALL_CODES, FLAW_TEXT
+from checker.job_store        import JOB_ID_RE
 from checker.text_plagiarism  import check_text_plagiarism
 from checker.image_plagiarism import check_image_plagiarism
 from checker.reporter         import (REPORT_CSP, generate_html_report,
@@ -148,7 +149,6 @@ app.config.update(
 REPORTS_DIR = job_store.REPORTS_DIR
 REPORTS_DIR.mkdir(exist_ok=True)
 
-JOB_ID_RE = re.compile(r'^[0-9a-f]{6,40}$')     # id проверки – только hex
 # Форматы работ. DOCX, ODT и DOC перед разбором приводятся к PDF, поэтому
 # дальше первого шага проверки разница между ними не доходит.
 DOC_EXTS = ('.pdf',) + convert.SOURCE_EXTS
@@ -1616,7 +1616,7 @@ def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
     try:
         with jobs_lock:
             for _ in range(8):
-                job_id = uuid.uuid4().hex
+                job_id = uuid.uuid4().hex[:5]
                 if job_id in jobs or (REPORTS_DIR / f'{job_id}.html').exists():
                     continue
                 if job_store.create(job_id, job):

@@ -50,13 +50,13 @@ class JobLifecycleTests(TestCase):
         self.assertFalse(job_store.load_all())
 
     def test_collision_preserves_existing_record_and_orphan_report(self):
-        existing, orphan, fresh = (s * 32 for s in 'abc')
+        existing, orphan, fresh = 'aaaaa', 'bbbbb', 'ccccc'
         old = {'owner': 'another', 'status': 'done'}
         job_store.save(existing, old)
         report = self.reports / f'{orphan}.html'
         report.write_text('earlier report')
         with (patch.object(web.uuid, 'uuid4', side_effect=[
-                SimpleNamespace(hex=key) for key in (existing, orphan, fresh)]),
+                SimpleNamespace(hex=key.ljust(32, '0')) for key in (existing, orphan, fresh)]),
               patch.object(threading.Thread, 'start')):
             self.assertEqual(self.launch(), (fresh, None, 200))
         self.assertEqual(job_store.get(existing), old)

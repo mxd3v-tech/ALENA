@@ -69,7 +69,7 @@ class MigrationIntegrityTests(unittest.TestCase):
                    'matches': [{'pct': 60.5}, {'pct': None}]}
         legacy = {'threshold': 60, 'plag': 80, 'students': [{'fio': 'Иванов', 'plag': 80}],
                   'matches': [{'pct': 80}]}
-        for job_id, digest in [('abc123', current), ('fedcba', legacy)]:
+        for job_id, digest in [('70c2e', current), ('70c2e6ba74ee476687593db2ece46355', legacy)]:
             job_store.save(job_id, {'owner': 'admin', 'status': 'done',
                                     'threshold': digest['threshold'], 'summary': digest})
         saved = job_store.load_all()

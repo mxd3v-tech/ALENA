@@ -103,15 +103,18 @@ Start a check. `multipart/form-data`:
 
 ```json
 {
-  "job_id": "a1b2c3d4e5",
+  "job_id": "a1b2c",
   "status": "processing",
   "links": {
-    "self":   "/api/v1/jobs/a1b2c3d4e5",
-    "report": "/api/v1/jobs/a1b2c3d4e5/report",
-    "export": "/api/v1/jobs/a1b2c3d4e5/export"
+    "self":   "/api/v1/jobs/a1b2c",
+    "report": "/api/v1/jobs/a1b2c/report",
+    "export": "/api/v1/jobs/a1b2c/export"
   }
 }
 ```
+
+New jobs use five lowercase hexadecimal characters for `job_id`. Use the full
+ID returned by the API for older jobs too, since their IDs can be longer.
 
 `400` when no files are supplied or no report is found inside the upload.
 `413` when the files exceed the configured batch limit or the multipart body exceeds the request limit.
@@ -121,7 +124,7 @@ List the jobs visible to the caller, keyed by `job_id`:
 
 ```json
 {
-  "a1b2c3d4e5": {
+  "a1b2c": {
     "status": "done",
     "progress": 100,
     "step": "Готово! Проверено 12 отчётов, сохранено в базу: 12.",
@@ -298,7 +301,7 @@ check the `owner` field to tell them apart:
     "pages_count": 14,
     "image_count": 3,
     "added_at": "20.06.2026 09:35",
-    "job_id": "a1b2c3d4e5",
+    "job_id": "a1b2c",
     "owner": "sokolova"
   }
 ]

@@ -432,6 +432,7 @@
   }
 
   function initChecks() {
+    const jobLabel = id => '#' + esc(id.slice(0, 5));
     const seesAll = checksRoot.dataset.seesAll === '1';
     const canDelete = checksRoot.dataset.canDelete === '1';
     const canDeleteAll = checksRoot.dataset.canDeleteAll === '1';
@@ -514,7 +515,7 @@
         return `<li role="option" aria-selected="${j.id === selected}">
           <button class="job" data-job="${esc(j.id)}" style="--tone:${toneVar(tone)}" aria-selected="${j.id === selected}">
             <span class="job-top">
-              <span class="job-id mono">#${esc(j.id.slice(0, 6))}</span>
+              <span class="job-id mono">${jobLabel(j.id)}</span>
               <span class="job-group">${esc(batchGroups(s).join(', ') || '–')}</span>
             </span>
             <span class="job-meta">
@@ -567,7 +568,7 @@
         <div class="detail-head">
           <div class="detail-title">
             <h2>${esc(batchGroups(s).join(', ') || 'Проверка')}</h2>
-            <span class="mono">#${esc(j.id)}</span>
+            <span class="mono">${jobLabel(j.id)}</span>
             ${j.status === 'done' ? chip('ok', 'Готово')
               : j.status === 'processing' ? chip('idle', 'Выполняется')
               : j.status === 'cancelled' ? chip('idle', 'Прервана') : chip('crit', 'Ошибка')}
@@ -830,7 +831,7 @@
         title: 'Прервать проверку?',
         sub: 'Если сервер подтвердит отмену, проверка остановится. Отчёт не будет сохранён, '
            + 'отпечатки в базу не попадут.',
-        body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">#${esc(b.dataset.stop)}</b></p>`,
+        body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">${jobLabel(b.dataset.stop)}</b></p>`,
         okText: 'Прервать', danger: true,
         onOk: async () => {
           if (await postAction(`/jobs/${b.dataset.stop}/cancel`)) { toast('Останавливаем проверку…'); load(); }
@@ -844,7 +845,7 @@
       b.onclick = () => confirmAction({
         title: 'Удалить проверку?',
         sub: 'Отчёт и запись в истории будут удалены. Отпечатки студентов останутся в базе – их удаляют отдельно.',
-        body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">#${esc(b.dataset.del)}</b></p>`,
+        body: `<p style="margin:0;font-size:13px;">Проверка <b class="mono">${jobLabel(b.dataset.del)}</b></p>`,
         okText: 'Удалить', danger: true,
         onOk: async () => {
           if (await postAction(`/jobs/${b.dataset.del}/delete`)) { toast('Проверка удалена'); selected = null; load(); }

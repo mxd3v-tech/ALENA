@@ -21,6 +21,7 @@ except ImportError:  # Windows local development; production image is Linux.
 STORE_PATH = Path(__file__).parent.parent / 'memory' / 'jobs.json'
 STORE_DIR = Path(__file__).parent.parent / 'memory' / 'jobs'
 REPORTS_DIR = Path(__file__).parent.parent / 'reports'
+JOB_ID_RE = re.compile(r'[0-9a-f]{5,40}')  # Старые проверки могут иметь более длинные номера.
 _lock = jsonstore.lock
 _ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 # Путь файла проверки → её владелец: см. `_owners_unlocked`. Ключ – путь, а не
