@@ -121,7 +121,7 @@ docker compose up --build
 ветки `main` выкладываются на Docker Hub.
 
 ```bash
-docker pull mxd3v-tech/alena:latest
+docker pull mxd3v/alena:latest
 ```
 
 ### Локально
@@ -544,7 +544,7 @@ libraries – nothing else to install. Building it yourself is optional: every
 build from `main` is published to Docker Hub.
 
 ```bash
-docker pull mxd3v-tech/alena:latest
+docker pull mxd3v/alena:latest
 ```
 
 ### Local

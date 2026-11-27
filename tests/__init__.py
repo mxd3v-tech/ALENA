@@ -1,26 +1,30 @@
 """Набор тестов проекта. Запуск: ``python -m unittest discover -s tests -t .``
 
-Хранилища переводятся во временный каталог здесь, а не в отдельных тестах:
-импорт app.py – это и есть запуск приложения. Он заводит первого
-администратора и переписывает settings.json под текущую схему критериев, и
-происходит это на импорте тестового модуля, раньше любого setUp. Без подмены
-прогон тестов затирал бы настройки рабочей установки, а на чистой машине –
-заводил бы там учётные записи и каталог отчётов.
+При импорте app.py приложение обновляет настройки и удаляет старые каталоги
+загрузок ещё до первого setUp. Поэтому весь набор использует JSON-хранилища
+и каталог загрузок внутри одного временного каталога.
 
 Каталог живёт до конца процесса: history-тесты и тесты хранилищ пишут в него
 по-настоящему, а изоляцию друг от друга обеспечивают сами.
 """
 
 import atexit
+import os
 import tempfile
 from pathlib import Path
-
-from checker import accounts, job_store, memory_store, teams
 
 _SANDBOX = tempfile.TemporaryDirectory(prefix='alena_tests_')
 atexit.register(_SANDBOX.cleanup)
 
 DATA_DIR = Path(_SANDBOX.name)
+os.environ.pop('DATABASE_URL', None)
+os.environ['AU_TMP_DIR'] = str(DATA_DIR / 'tmp')
+
+from checker import accounts, db, job_store, memory_store, teams
+
+# При обнаружении тестов checker.db мог уже прочитать окружение.
+db.DATABASE_URL = ''
+db.DB_ENABLED = False
 
 accounts.DATA_DIR   = DATA_DIR
 accounts.USERS_PATH = DATA_DIR / 'users.json'

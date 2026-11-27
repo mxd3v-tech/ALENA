@@ -1,5 +1,4 @@
 import io
-import os
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -11,6 +10,7 @@ import imagehash
 import pymupdf
 from PIL import Image
 
+import tests  # Initialize the sandbox even for top-level unittest discovery.
 from checker import accounts, db, job_store, memory_store, sqlmigrate, teams
 from checker.image_plagiarism import check_image_plagiarism
 from checker.reporter import _anchor, _report_anchors, generate_html_report
@@ -22,19 +22,8 @@ from checker.text_plagiarism import (
 from checker.memory_store import NO_STUDENT, student_id
 
 
-# app.py performs production startup work at import time. Keep that import away
-# from the real JSON stores and temporary directories used by a running instance.
-_SAFE_TMP = tempfile.TemporaryDirectory()
-with (patch.object(db, 'DB_ENABLED', False),
-      patch.dict(os.environ, {'AU_TMP_DIR': _SAFE_TMP.name}),
-      patch('checker.accounts.bootstrap'),
-      patch('checker.accounts.get_settings', return_value={
-          'gost_schema': 2,
-          'retention_days': 0,
-      }),
-      patch('checker.accounts.load_users', return_value={}),
-      patch('checker.job_store.load_all', return_value={}),
-      patch('tempfile.gettempdir', return_value=_SAFE_TMP.name)):
+# The web tests supply their own users and need no bootstrap administrator.
+with patch.object(accounts, 'bootstrap'):
     import app as web
 
 
