@@ -69,6 +69,7 @@ SCHEMA = [
     # отсчёт для них идёт от даты создания.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS pw_changed_at TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS account_id TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS seen_release TEXT",
     """
     CREATE TABLE IF NOT EXISTS login_events (
         id     BIGSERIAL PRIMARY KEY,
@@ -367,7 +368,7 @@ def jobs_delete(job_id: str) -> bool:
 
 USER_COLS = ('login', 'fio', 'email', 'role', 'state', 'password_hash',
               'perms', 'api_key', 'must_change', 'created_at', 'pw_changed_at',
-              'last_login', 'fail_count', 'locked_until', 'account_id')
+              'last_login', 'fail_count', 'locked_until', 'account_id', 'seen_release')
 
 
 def users_load_all() -> dict:

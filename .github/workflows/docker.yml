@@ -21,6 +21,15 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - name: Check release tag against installed version
+        if: github.ref_type == 'tag'
+        run: |
+          python - <<'PYTHON'
+          import os
+          from checker.releases import APP_VERSION
+          if os.environ['GITHUB_REF_NAME'] != f'v{APP_VERSION}':
+              raise SystemExit(f'Expected tag v{APP_VERSION} from checker/changelog.json')
+          PYTHON
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -t .
 
@@ -60,3 +69,24 @@ jobs:
           # не меняются – без кеша каждая сборка тянула бы их заново.
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    needs: verify
+    if: github.ref_type == 'tag' && github.repository == 'mxd3v-tech/ALENA'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PYTHON' > "$RUNNER_TEMP/release-notes.md"
+          from checker.releases import CHANGELOG
+          print("### Что нового\n")
+          for change in CHANGELOG[0]['changes']:
+              print(f"- {change}")
+          PYTHON
+          gh release create "$GITHUB_REF_NAME" --verify-tag --latest \
+            --title "АЛЁНА ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/release-notes.md"

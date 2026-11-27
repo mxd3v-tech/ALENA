@@ -158,9 +158,13 @@
             <img src="{{ logo_url() }}" alt="Логотип {{ brand.TEAM }}" width="54" height="54">
             <div>
               <div class="about-name">{{ app_title }}</div>
-              <div class="hint">{{ brand.APP_TAGLINE }} · версия {{ brand.APP_VERSION }}</div>
+              <div class="hint">{{ brand.APP_TAGLINE }} · <a href="{{ url_for('changelog') }}" title="Журнал изменений">версия {{ brand.APP_VERSION }}</a></div>
             </div>
           </div>
+          <p>
+            <button class="btn" type="button" id="check-update" data-url="{{ url_for('admin_check_update') }}">Проверить наличие новой версии</button>
+          </p>
+          <div id="update-result" class="hint" role="status"></div>
           <ul class="acronym big">
             {% for letter, word in brand.ACRONYM %}
             <li><b>{{ letter }}</b>{{ word[1:] }}</li>

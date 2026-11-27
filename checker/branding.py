@@ -8,6 +8,8 @@
 import base64
 from pathlib import Path
 
+from checker.releases import APP_VERSION as APP_VERSION
+
 APP_TITLE = 'АЛЁНА'
 
 # Расшифровка идёт построчно: буква – слово. Иначе, читая подряд, аббревиатуру
@@ -24,7 +26,6 @@ APP_FULL_NAME = 'Автоматический Ловец Ёрничества, �
 APP_TAGLINE = 'Проверка студенческих отчётов'
 
 TEAM = '#au_team'
-APP_VERSION = '1.0'
 
 LOGO_PATH = Path(__file__).parent.parent / 'au_logo.png'
 

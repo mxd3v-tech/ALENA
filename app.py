@@ -41,6 +41,7 @@ import zipfile
 import tempfile
 import shutil
 import threading
+from http.client import HTTPException as HTTPClientError
 from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -58,7 +59,7 @@ except Exception:
     WEASYPRINT_OK = False
 
 from checker import (accounts, branding, convert, db, grading, job_store,
-                     sqlmigrate, summary as summary_mod, teams)
+                     releases, sqlmigrate, summary as summary_mod, teams)
 from checker.extractor        import extract_report
 from checker.gost             import check_gost, GOST_CHECKS, ALL_CODES, FLAW_TEXT
 from checker.text_plagiarism  import check_text_plagiarism
@@ -242,6 +243,7 @@ def inject_globals():
         'user':          getattr(g, 'user', None),
         'app_title':     APP_TITLE,
         'app_full_name': APP_FULL_NAME,
+        'current_release': releases.CHANGELOG[0],
         'brand':         branding,
         'csrf_token':    _csrf_token,
         'ROLES':         accounts.ROLES,
@@ -1004,6 +1006,31 @@ def admin_log():
         e['fio'] = fio_by_login.get(e.get('login', ''), '')
     return render_template('log.html', page='log', events=events,
                            only_fail=only_fail)
+
+
+@app.post('/changelog/<version>/seen')
+@login_required
+def release_seen(version):
+    if version != releases.APP_VERSION:
+        abort(409)
+    if not accounts.mark_release_seen(g.user['login'], g.user['account_id'], version):
+        abort(403)
+    return jsonify(ok=True)
+
+
+@app.get('/changelog')
+@login_required
+def changelog():
+    return render_template('changelog.html', releases=releases.CHANGELOG)
+
+
+@app.post('/admin/settings/check-update')
+@admin_required
+def admin_check_update():
+    try:
+        return jsonify(releases.check_update())
+    except (OSError, HTTPClientError, ValueError):
+        return jsonify(error='Не удалось проверить версию на GitHub. Попробуйте позже.'), 502
 
 
 @app.route('/admin/settings', methods=['GET', 'POST'])

@@ -44,6 +44,37 @@
     }
   }
 
+  const updateButton = $('#check-update');
+  if (updateButton) {
+    updateButton.onclick = async () => {
+      const result = $('#update-result');
+      updateButton.disabled = true;
+      result.textContent = 'Проверяем выпуски на GitHub…';
+      try {
+        const data = await requestJson(updateButton.dataset.url, {
+          method: 'POST', headers: { 'X-CSRF-Token': CSRF }
+        });
+        result.textContent = data.message;
+        if (data.url) {
+          const link = document.createElement('a');
+          link.href = data.url;
+          link.textContent = 'Что изменилось';
+          result.append(' ', link);
+        }
+      } catch (err) {
+        result.textContent = err.message;
+      } finally {
+        updateButton.disabled = false;
+      }
+    };
+  }
+
+  const releaseNotice = $('#release-notice');
+  if (releaseNotice && typeof releaseNotice.showModal === 'function') {
+    releaseNotice.showModal();
+    postAction(releaseNotice.dataset.seenUrl);
+  }
+
   const accessDenied = err => err.status === 401 || err.status === 403;
 
   /* ── Общее: тема, меню, всплывающие сообщения ── */

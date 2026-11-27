@@ -257,6 +257,14 @@ def set_password(login: str, password: str, must_change: bool = False, *,
     return True
 
 
+def mark_release_seen(login: str, account_id: str, version: str) -> bool:
+    with _edit_user(login) as user:
+        if not user or user.get('account_id') != account_id or user['state'] != 'active':
+            return False
+        user['seen_release'] = version
+    return True
+
+
 def set_permissions(login: str, role: str, perms: dict) -> bool:
     with _edit_user(login) as user:
         if not user or user['state'] == 'deleted':

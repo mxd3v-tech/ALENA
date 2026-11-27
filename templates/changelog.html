@@ -1,0 +1,14 @@
+{% extends "layout.html" %}
+{% block title %}Журнал изменений{% endblock %}
+{% block heading %}Журнал изменений{% endblock %}
+{% block subheading %}Установлена версия {{ brand.APP_VERSION }}{% endblock %}
+{% block content %}
+  {% for release in releases %}
+  <section class="section">
+    <div class="section-head"><h2>Версия {{ release.version }}</h2></div>
+    <div class="section-body">
+      <ul>{% for change in release.changes %}<li>{{ change }}</li>{% endfor %}</ul>
+    </div>
+  </section>
+  {% endfor %}
+{% endblock %}
