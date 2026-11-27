@@ -1,0 +1,25 @@
+name: Update release notes
+
+on:
+  push:
+    branches: [main]
+    paths: [checker/changelog.json]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sync notes for the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$(python -c 'from checker.releases import APP_VERSION; print(APP_VERSION)')"
+          published=$(gh release list --exclude-drafts --limit 100 --json tagName --jq '.[].tagName')
+          if grep -Fxq "$tag" <<< "$published"; then
+            python -m checker.releases > "$RUNNER_TEMP/release-notes.md"
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

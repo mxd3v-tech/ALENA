@@ -8,6 +8,14 @@
     <div class="section-head"><h2>Версия {{ release.version }}</h2></div>
     <div class="section-body">
       <ul>{% for change in release.changes %}<li>{{ change }}</li>{% endfor %}</ul>
+      {% if release.commits %}
+      <h3>История коммитов</h3>
+      <ol>
+        {% for commit in release.commits %}
+        <li>{{ commit.description }} <a class="mono" href="https://github.com/mxd3v-tech/ALENA/commit/{{ commit.sha }}">{{ commit.sha[:7] }}</a></li>
+        {% endfor %}
+      </ol>
+      {% endif %}
     </div>
   </section>
   {% endfor %}

@@ -82,11 +82,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PYTHON' > "$RUNNER_TEMP/release-notes.md"
-          from checker.releases import CHANGELOG
-          print("### Что нового\n")
-          for change in CHANGELOG[0]['changes']:
-              print(f"- {change}")
-          PYTHON
+          python -m checker.releases > "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" --verify-tag --latest \
             --title "АЛЁНА ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/release-notes.md"

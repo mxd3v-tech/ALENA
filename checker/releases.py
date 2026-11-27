@@ -33,3 +33,15 @@ def check_update():
     if available > version_parts(APP_VERSION):
         return {'message': f'Доступна версия {latest}.', 'url': f'{RELEASES_URL}/tag/{tag}'}
     return {'message': f'Более новой версии нет. Последний выпуск на GitHub — {latest}.'}
+
+
+if __name__ == '__main__':
+    release = CHANGELOG[0]
+    print('### Что нового\n')
+    for change in release['changes']:
+        print(f'- {change}')
+    if release.get('commits'):
+        print('\n### История коммитов\n')
+        for commit in release['commits']:
+            sha = commit['sha']
+            print(f"- {commit['description']} [{sha[:7]}](https://github.com/mxd3v-tech/ALENA/commit/{sha})")
