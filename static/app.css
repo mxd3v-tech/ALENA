@@ -79,8 +79,6 @@
 /* ─────────────────────────── Токены ─────────────────────────── */
 
 :root {
-  color-scheme: light;
-
   /* Бренд */
   --brand:        #015D1E;
   --brand-hover:  #024E19;
@@ -92,7 +90,7 @@
   --ink-strong:   #0B0F0C;
   --muted:        #5F6B62;
   --muted-soft:   #8C968F;
-  --surface:      #FFFFFF;
+  /* Цвет --surface и color-scheme заданы в _appearance.html до загрузки стилей. */
   --surface-2:    #f6f8f6;
   --surface-3:    #edf1ee;
   --rule:         #D9DFDB;
@@ -180,10 +178,9 @@
    применяется и по системной настройке, и по явному переключателю. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    color-scheme: dark;
     --brand:#4FB069; --brand-hover:#6CC987; --brand-soft:#0E2415; --on-brand:#0B130D;
     --ink:#E8ECE9; --ink-strong:#FFFFFF; --muted:#9AA59E; --muted-soft:#6F7A73;
-    --surface:#0F1411; --surface-2:#161d18; --surface-3:#1f2822;
+    --surface-2:#161d18; --surface-3:#1f2822;
     --rule:#2A332C; --rule-strong:#3A4640;
     --success:#3FBF92; --success-soft:#102A22;
     --attention:#E2B85C; --attention-soft:#2B2415;
@@ -199,10 +196,9 @@
   }
 }
 :root[data-theme="dark"] {
-  color-scheme: dark;
   --brand:#4FB069; --brand-hover:#6CC987; --brand-soft:#0E2415; --on-brand:#0B130D;
   --ink:#E8ECE9; --ink-strong:#FFFFFF; --muted:#9AA59E; --muted-soft:#6F7A73;
-  --surface:#0F1411; --surface-2:#161d18; --surface-3:#1f2822;
+  --surface-2:#161d18; --surface-3:#1f2822;
   --rule:#2A332C; --rule-strong:#3A4640;
   --success:#3FBF92; --success-soft:#102A22;
   --attention:#E2B85C; --attention-soft:#2B2415;
@@ -677,18 +673,10 @@ input[type="range"] { width: 100%; accent-color: var(--brand); }
 /* Подсказки к критериям */
 .has-hint { border-bottom: 1px dotted var(--muted); cursor: help; }
 
-/* ── Движение. Сдержанное: короткие входы и мягкие развороты, ничего,
-      что заставляет ждать. При prefers-reduced-motion всё отключается
-      правилом в начале файла. ── */
+/* ── Анимации элементов управления ── */
 
-@keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes pop  { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
-
-.scroll > * { animation: rise .24s ease-out both; }
-.scroll > *:nth-child(2) { animation-delay: .04s; }
-.scroll > *:nth-child(3) { animation-delay: .08s; }
-.scroll > *:nth-child(4) { animation-delay: .12s; }
 
 #detail-pane.swap { animation: fade .18s ease-out both; }
 

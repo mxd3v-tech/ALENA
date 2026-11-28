@@ -4,11 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Доступ закрыт – {{ app_title }}</title>
-  {# Тема – до первой отрисовки, чтобы страница не мигала светлой. #}
-  <script>try{var t=localStorage.getItem('alena-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
-  <link rel="preload" href="{{ url_for('static', filename='fonts/manrope-cyrillic.woff2') }}" as="font" type="font/woff2" crossorigin>
-  <link rel="preload" href="{{ url_for('static', filename='fonts/manrope-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="{{ asset('app.css') }}">
+  {% include "_appearance.html" %}
   <link rel="icon" href="{{ logo_url() }}">
 </head>
 <body>

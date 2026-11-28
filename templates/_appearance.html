@@ -1,0 +1,25 @@
+<meta name="color-scheme" content="light dark">
+<script>
+  try {
+    const theme = localStorage.getItem('alena-theme');
+    if (theme === 'light' || theme === 'dark') {
+      document.documentElement.dataset.theme = theme;
+    }
+  } catch {}
+</script>
+{# Фон документа нужен уже в первом кадре, пока загружается app.css. #}
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #FFFFFF;
+    background-color: var(--surface);
+  }
+  :root[data-theme="dark"] { color-scheme: dark; --surface: #0F1411; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { color-scheme: dark; --surface: #0F1411; }
+  }
+</style>
+<link rel="stylesheet" href="{{ asset('app.css') }}">
+{# Адреса шрифтов совпадают с адресами в app.css для повторного использования загрузки. #}
+<link rel="preload" href="{{ url_for('static', filename='fonts/manrope-cyrillic.woff2') }}" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="{{ url_for('static', filename='fonts/manrope-latin.woff2') }}" as="font" type="font/woff2" crossorigin>
