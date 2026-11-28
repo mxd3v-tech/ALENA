@@ -108,7 +108,7 @@ class UploadIntegrityTests(unittest.TestCase):
             self.assertTrue(release.wait(5))
             copy(src, dst, length)
 
-        def slow_launch(*args):
+        def slow_launch(*args, **kwargs):
             self.assertEqual(path.read_bytes(), b'abc')
             launched.set()
             self.assertTrue(finish.wait(5))

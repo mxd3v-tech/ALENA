@@ -62,7 +62,7 @@ class MigrationIntegrityTests(unittest.TestCase):
         self.assertEqual(job_store.count(), 1)
         self.assertEqual(accounts.get_user('admin')['perms'], {})
 
-    def test_backup_round_trips_fractional_and_legacy_similarity_scores(self):
+    def test_backup_round_trips_full_gost_only_and_legacy_checks(self):
         current = {'threshold': 60.25, 'plag': 60.5, 'plag_flagged': True,
                    'students': [{'fio': 'Иванов', 'plag': 60.5, 'plag_flagged': True},
                                 {'fio': 'Петров', 'plag': 59.6, 'plag_flagged': False}],
@@ -72,6 +72,13 @@ class MigrationIntegrityTests(unittest.TestCase):
         for job_id, digest in [('70c2e', current), ('70c2e6ba74ee476687593db2ece46355', legacy)]:
             job_store.save(job_id, {'owner': 'admin', 'status': 'done',
                                     'threshold': digest['threshold'], 'summary': digest})
+        job_store.save('abc98', {
+            'owner': 'admin', 'status': 'done', 'mode': 'gost_only', 'threshold': None,
+            'text_pairs': None, 'img_pairs': None,
+            'summary': {'gost': 75, 'threshold': None, 'plag': None, 'plag_flagged': None,
+                        'matches': [], 'matches_total': None,
+                        'students': [{'fio': 'Петров', 'plag': None, 'plag_flagged': None}]},
+        })
         saved = job_store.load_all()
         backup = sqlmigrate.dump()
         job_store.clear()
@@ -80,6 +87,8 @@ class MigrationIntegrityTests(unittest.TestCase):
 
     def test_invalid_similarity_fields_are_rejected(self):
         for data, field in [
+            ({'mode': 'typo'}, 'jobs.mode'),
+            ({'mode': 'gost_only', 'text_pairs': 0}, 'jobs.text_pairs'),
             ({'threshold': 100.01}, 'jobs.threshold'),
             ({'summary': {'plag': -1}}, 'jobs.summary.plag'),
             ({'summary': {'threshold': True}}, 'jobs.summary.threshold'),

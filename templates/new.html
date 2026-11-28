@@ -19,8 +19,8 @@
       <div class="track big"><div class="fill" id="run-bar" style="width:0;--tone:var(--brand)"></div></div>
       <div class="stat-row">
         <span class="stat-chip">Файлов: <b id="run-files">0 / 0</b></span>
-        <span class="stat-chip">Пар текста: <b id="run-pairs">0</b></span>
-        <span class="stat-chip">Дублей изображений: <b id="run-imgs">0</b></span>
+        <span class="stat-chip" data-run-comparison>Пар текста: <b id="run-pairs">0</b></span>
+        <span class="stat-chip" data-run-comparison>Дублей изображений: <b id="run-imgs">0</b></span>
       </div>
       <div class="stat-row">
         <button class="btn sm danger" type="button" id="run-cancel">Прервать проверку</button>
@@ -33,6 +33,21 @@
 
   <div class="grid-2">
     <div>
+      <div class="section" role="radiogroup" aria-labelledby="mode-title">
+        <div class="section-head"><h2 id="mode-title">Режим проверки</h2></div>
+        <div class="section-body">
+          <label class="check">
+            <input type="radio" name="mode" value="full" checked>
+            <span><b>Заимствования и ГОСТ</b><br>
+              <span class="hint">Сравнить текст и изображения, проверить оформление.</span></span>
+          </label>
+          <label class="check">
+            <input type="radio" name="mode" value="gost_only">
+            <span><b>Только ГОСТ</b><br>
+              <span class="hint">Проверить оформление и сохранить отпечатки работ для будущих сравнений.</span></span>
+          </label>
+        </div>
+      </div>
       <div class="section">
         <div class="section-head"><h2>Файлы</h2></div>
         <div class="section-body">
@@ -47,7 +62,7 @@
         </div>
       </div>
 
-      <div class="section">
+      <div class="section" id="comparison-settings">
         <div class="section-head"><h2>Поиск заимствований</h2></div>
         <div class="section-body">
           <div class="field">
@@ -133,6 +148,7 @@
           В балл ГОСТ и в рекомендуемую оценку войдут только отмеченные критерии –
           <b class="mono" id="gost-count"></b>.
         </p>
+        <p class="hint" id="gost-required" role="status" hidden>Выберите хотя бы один критерий ГОСТ для запуска.</p>
       </div>
     </div>
   </div>

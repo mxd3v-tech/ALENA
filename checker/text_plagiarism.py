@@ -36,6 +36,10 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def has_comparable_text(normalized_text: str) -> bool:
+    return len(normalized_text.split(None, MIN_COMPARE_WORDS - 1)) >= MIN_COMPARE_WORDS
+
+
 def text_fingerprint(normalized_text: str) -> str:
     """Stable digest used to recognize the same anonymous stored work."""
     if not normalized_text:
@@ -185,7 +189,7 @@ def check_text_plagiarism(reports: list, threshold: float = 0.6,
         path = report['path']
         norm = (report.get('normalized_text')
                 or normalize_text(report.get('full_text', '')))
-        if len(norm.split()) < MIN_COMPARE_WORDS:
+        if not has_comparable_text(norm):
             no_text.add(path)
         student = report.get('student', {})
         name = str(student.get('name') or '').strip().lower()

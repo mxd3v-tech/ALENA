@@ -17,7 +17,7 @@
   </div>
   <div class="tile">
     <span class="eyebrow">Требуют внимания</span>
-    <span class="tile-val">{{ flagged }}</span>
+    <span class="tile-val">{{ flagged if flagged is not none else '–' }}</span>
     <span class="tile-foot">совпадений выше порога</span>
   </div>
   <div class="tile">
@@ -69,7 +69,7 @@
     <table>
       <thead>
         <tr>
-          <th>Проверка</th><th>Группа</th>
+          <th>Проверка</th><th>Режим</th><th>Группа</th>
           {% if can(user, 'see_all') %}<th>Преподаватель</th>{% endif %}
           <th class="num">Файлов</th><th class="num">ГОСТ</th><th class="num">Заимств.</th><th>Когда</th>
         </tr>
@@ -78,15 +78,16 @@
         {% for r in recent %}
         <tr>
           <td>{% if r.has_report %}<a class="mono" href="{{ url_for('report', job_id=r.job_id) }}" target="_blank" rel="noopener">#{{ r.job_id[:5] }}</a>{% else %}<span class="mono">#{{ r.job_id[:5] }}</span> <span class="sub">{{ {'processing': 'Выполняется', 'cancelled': 'Прервана', 'error': 'Ошибка'}.get(r.status, 'Отчёт недоступен') }}</span>{% endif %}</td>
+          <td>{{ 'Только ГОСТ' if r.mode == 'gost_only' else 'Заимствования и ГОСТ' }}</td>
           <td>{{ r.summary.groups | join(', ') or '–' if r.summary else '–' }}</td>
           {% if can(user, 'see_all') %}<td>{{ r.owner_fio or '–' }}</td>{% endif %}
           <td class="num">{{ r.total or 0 }}</td>
           <td class="num">{{ r.summary.gost ~ '%' if r.summary and r.summary.get('gost') is not none else '–' }}</td>
-          <td class="num">{% if r.summary %}{{ r.summary.plag }}%{% else %}–{% endif %}</td>
+          <td class="num">{{ r.summary.plag ~ '%' if r.summary and r.summary.get('plag') is not none else '–' }}</td>
           <td class="mono sub">{{ r.created_at }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="empty">Проверок пока нет.</td></tr>
+        <tr><td colspan="{{ 8 if can(user, 'see_all') else 7 }}" class="empty">Проверок пока нет.</td></tr>
         {% endfor %}
       </tbody>
     </table>

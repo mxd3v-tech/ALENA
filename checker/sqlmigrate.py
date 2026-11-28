@@ -254,14 +254,19 @@ def _strings(values):
     return isinstance(values, list) and all(isinstance(s, str) for s in values)
 
 
-def _check_summary(summary):
+def _check_summary(summary, compare):
     for key in ('gost', 'grade', 'grade_score', 'scale', 'clean',
                 'matches_total', 'no_text'):
         value = summary.get(key)
         _require(value is None or type(value) in (int, float), f'jobs.summary.{key}')
     for key in ('plag', 'threshold'):
         _require(summary.get(key) is None or _percentage(summary[key]), f'jobs.summary.{key}')
-    _require(type(summary.get('plag_flagged', False)) is bool, 'jobs.summary.plag_flagged')
+    if compare:
+        _require(type(summary.get('plag_flagged', False)) is bool, 'jobs.summary.plag_flagged')
+    else:
+        for field in ('plag', 'plag_flagged', 'threshold', 'matches_total'):
+            _require(summary.get(field) is None, f'jobs.summary.{field}')
+        _require(not summary.get('matches'), 'jobs.summary.matches')
     if 'clean' in summary:
         _require(_integer(summary['clean']), 'jobs.summary.clean')
     _require(_strings(summary.get('groups', [])), 'jobs.summary.groups')
@@ -280,7 +285,11 @@ def _check_summary(summary):
         _require('work_id' not in student or _integer(student['work_id']), 'jobs.students.work_id')
         _require(student.get('gost') is None or _integer(student['gost']), 'jobs.students.gost')
         _require(student.get('plag') is None or _percentage(student['plag']), 'jobs.students.plag')
-        _require(type(student.get('plag_flagged', False)) is bool, 'jobs.students.plag_flagged')
+        if compare:
+            _require(type(student.get('plag_flagged', False)) is bool, 'jobs.students.plag_flagged')
+        else:
+            _require(student.get('plag') is None and student.get('plag_flagged') is None,
+                     'jobs.students.plag')
         grade = student.get('grade')
         if grade is not None:
             _require(isinstance(grade, dict) and all(grade.get(k) is None or
@@ -313,13 +322,17 @@ def _validate(table, rec):
                  ('done', 'error', 'processing', 'cancelled'), 'jobs.status')
         for field in ('owner', 'owner_fio', 'step', 'created_at', 'error'):
             _require(job.get(field) is None or isinstance(job[field], str), f'jobs.{field}')
-        for field in ('progress', 'total', 'done_files', 'text_pairs', 'img_pairs'):
+        mode = job.get('mode', 'full')
+        _require(mode in ('full', 'gost_only'), 'jobs.mode')
+        for field in ('progress', 'total', 'done_files'):
             _require(field not in job or _integer(job[field]), f'jobs.{field}')
-        _require('threshold' not in job or _percentage(job['threshold']), 'jobs.threshold')
+        for field, valid in (('text_pairs', _integer), ('img_pairs', _integer), ('threshold', _percentage)):
+            if field in job:
+                _require(valid(job[field]) if mode == 'full' else job[field] is None, f'jobs.{field}')
         _require(job.get('beat') is None or type(job['beat']) in (int, float), 'jobs.beat')
         _require(job.get('summary') is None or isinstance(job['summary'], dict), 'jobs.summary')
         if job.get('summary') is not None:
-            _check_summary(job['summary'])
+            _check_summary(job['summary'], mode == 'full')
         _require('job_id' not in job, 'jobs.data.job_id')
     elif table == 'users':
         _require(rec.get('role') in ('teacher', 'admin') and

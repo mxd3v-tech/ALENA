@@ -32,8 +32,10 @@
 сравнивать новую партию не только между собой, но и со всеми прошлыми сессиями –
 работа, сданная в сентябре, будет узнана в декабре.
 
-> Три проверки идут за один проход по одному и тому же документу: файл читается
-> один раз, а не трижды разными инструментами.
+При запуске выберите режим. **Заимствования и ГОСТ** сравнивает текст и
+изображения и проверяет оформление. **Только ГОСТ** выдаёт замечания по
+выбранным критериям и оценку за оформление. Оба режима сохраняют отпечатки
+работ для будущего поиска заимствований.
 
 ---
 
@@ -180,7 +182,7 @@ gunicorn --workers=1 --threads=8 --timeout=300 -b 0.0.0.0:5000 app:app
 | Раздел | Что там |
 |---|---|
 | **Проверки** | Загруженные партии, прогресс, отчёты, остановка идущей проверки |
-| **Новая проверка** | Загрузка папки или ZIP, выбор критериев, порог, веса |
+| **Новая проверка** | Выбор режима, загрузка папки или ZIP, критерии ГОСТ и их веса, порог для поиска заимствований |
 | **Обзор** | Сводка: успеваемость, частые нарушения, динамика |
 | **База отпечатков** | Что хранится, выгрузка таблицей или JSON-дампом, удаление записей |
 | **Пользователи** | Учётные записи, права, выдача ключей API |
@@ -466,8 +468,10 @@ repeat, which GOST clauses are violated, and what formatting grade follows.
 each new batch not only against itself but against every earlier session – work
 submitted in September is recognised in December.
 
-> All three checks run in a single pass over the same document: the file is read
-> once, not three times by three different tools.
+Choose a mode for each batch. **Borrowing and GOST** compares text and images
+and checks formatting. **GOST only** reports on the selected criteria and
+recommends a formatting grade. Both modes save fingerprints for future
+borrowing checks.
 
 ---
 
@@ -616,7 +620,7 @@ Settings).
 | Section | Contents |
 |---|---|
 | **Проверки** (Checks) | Uploaded batches, progress, reports, stopping a running check |
-| **Новая проверка** (New check) | Upload a folder or ZIP, pick criteria, threshold, weights |
+| **Новая проверка** (New check) | Choose a mode, upload a folder or ZIP, pick GOST criteria and weights, and set the threshold for borrowing checks |
 | **Обзор** (Overview) | Digest: performance, frequent violations, trends |
 | **База отпечатков** (Fingerprint base) | What is stored, spreadsheet or JSON-dump export, record deletion |
 | **Пользователи** (Users) | Accounts, permissions, API key issuance |

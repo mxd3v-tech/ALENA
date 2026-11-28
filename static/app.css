@@ -587,6 +587,7 @@ input[type="range"] { width: 100%; accent-color: var(--brand); }
 #upload-form.locked .crit, #upload-form.locked .field,
 #upload-form.locked .check, #upload-form.locked .eyebrow { opacity: .6; }
 #upload-form.locked .check { cursor: not-allowed; }
+#upload-form [hidden] { display: none !important; }
 .when-busy { display: none; }
 #upload-form.locked .when-idle { display: none; }
 #upload-form.locked .when-busy { display: inline; }

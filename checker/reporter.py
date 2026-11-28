@@ -563,9 +563,6 @@ NO_TEXT_NOTE = (
 
 def _render_text_plag_for_report(path: str, text_plagiarism: dict, threshold: float,
                                   report_by_path: dict, anchors: dict) -> str:
-    if path in set(text_plagiarism.get('no_text') or ()):
-        return NO_TEXT_NOTE
-
     matrix = text_plagiarism.get('matrix', {})
     pairs  = text_plagiarism.get('pairs', [])
 
@@ -728,7 +725,7 @@ def _render_img_plag_for_report(path: str, image_plagiarism: dict,
 
 
 def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: bool,
-                     threshold: float, weights: dict, scale: int,
+                     threshold: float | None, weights: dict, scale: int,
                      no_text: bool = False) -> str:
     """Рекомендуемая оценка и готовый к копированию отзыв для одной работы."""
     mark = None if no_text else grading.grade(gost_results, weights, scale)
@@ -743,7 +740,7 @@ def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: 
     }
     if not gost_results:
         student['gost'] = None
-    thr_pct = grading.as_percent(threshold)
+    thr_pct = grading.as_percent(threshold) if threshold is not None else None
     lines = grading.feedback_lines(student, thr_pct)
     plain = grading.feedback_text(student, thr_pct)
 
@@ -787,8 +784,8 @@ def _render_feedback(report: dict, gost_results: list, plag_pct, has_text_plag: 
 
 
 def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
-                 threshold: float, report_by_path: dict,
-                 anchors: dict,
+                 threshold: float | None, report_by_path: dict,
+                 anchors: dict, no_text: bool,
                  weights: dict = None, scale: int = grading.DEFAULT_SCALE) -> str:
     path = report['path']
     gost_results = report.get('gost_results', [])
@@ -797,10 +794,10 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
 
     matrix = text_plagiarism.get('matrix', {})
     max_sim, other = _max_sim(path, matrix)
-    plag_pct = grading.similarity_percent(max_sim, threshold)
-    no_text = path in set(text_plagiarism.get('no_text') or ())
+    compare = threshold is not None
+    plag_pct = grading.similarity_percent(max_sim, threshold) if compare else None
 
-    has_text_plag = other is not None and max_sim >= threshold and not no_text
+    has_text_plag = compare and other is not None and max_sim >= threshold and not no_text
     has_img_plag  = any(
         (p['report1'] == path or p['report2'] == path) and not p.get('ui_review')
         for p in image_plagiarism.get('pairs', [])
@@ -855,9 +852,23 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
 </div>'''
 
     gost_table = _render_gost_table(gost_results) if total else ''
-    text_plag  = _render_text_plag_for_report(
-        path, text_plagiarism, threshold, report_by_path, anchors)
-    img_plag   = _render_img_plag_for_report(path, image_plagiarism, report_by_path)
+    similarity_label = ''
+    comparisons = ''
+    if compare:
+        similarity_label = ' &nbsp;|&nbsp; Схожесть: ' + ('–' if no_text else f'{plag_pct}%')
+        text_plag = (NO_TEXT_NOTE if no_text else
+                     _render_text_plag_for_report(path, text_plagiarism, threshold,
+                                                  report_by_path, anchors))
+        img_plag = _render_img_plag_for_report(path, image_plagiarism, report_by_path)
+        comparisons = f'''
+      <div>
+        <h3>Заимствование текста</h3>
+        {text_plag}
+        <div style="margin-top:var(--space-5);">
+          <h3>Заимствование изображений</h3>
+          {img_plag}
+        </div>
+      </div>'''
 
     return f'''
 <div class="report-card" id="{_anchor(report, anchors)}">
@@ -865,7 +876,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
     <span style="font-size:var(--text-16);font-weight:600;flex:1;">{_esc(_display_name(report))}</span>
     {badge}
     <span style="font-size:var(--text-13);color:var(--muted);white-space:nowrap;">
-      ГОСТ: {f'{passed}/{total}' if total else 'не проверялся'} &nbsp;|&nbsp; Схожесть: {'–' if no_text else f'{plag_pct}%'}
+      ГОСТ: {f'{passed}/{total}' if total else 'не проверялся'}{similarity_label}
     </span>
     <span class="toggle-arrow">▼</span>
   </div>
@@ -876,7 +887,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
 
     {_render_feedback(report, gost_results, plag_pct, has_text_plag, threshold, weights, scale, no_text)}
 
-    <div class="grid-2">
+    <div{(' class="grid-2"' if compare else '')}>
       <!-- GOST -->
       <div>
         <h3>ГОСТ 7.32-2017</h3>
@@ -890,15 +901,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
         {gost_table}
       </div>
 
-      <!-- Plagiarism -->
-      <div>
-        <h3>Заимствование текста</h3>
-        {text_plag}
-        <div style="margin-top:var(--space-5);">
-          <h3>Заимствование изображений</h3>
-          {img_plag}
-        </div>
-      </div>
+      {comparisons}
     </div>
   </div>
 </div>'''
@@ -906,7 +909,7 @@ def _render_card(report: dict, text_plagiarism: dict, image_plagiarism: dict,
 
 def generate_html_report(reports: list, historical: list,
                          text_plagiarism: dict, image_plagiarism: dict,
-                         threshold: float = 0.6, job_id: str = '',
+                         threshold: float | None = 0.6, job_id: str = '',
                          weights: dict = None,
                          scale: int = grading.DEFAULT_SCALE) -> str:
     """
@@ -916,14 +919,15 @@ def generate_html_report(reports: list, historical: list,
         reports: newly checked reports (full report dicts with gost_results etc.)
         historical: virtual report dicts from memory store (is_historical=True)
         text_plagiarism, image_plagiarism: results from checker modules
-        threshold: similarity threshold (0-1)
+        threshold: similarity threshold (0-1), or None for a GOST-only report
         weights: «процент использования» критериев для рекомендуемой оценки
         scale: шкала оценки (100 – проценты)
         job_id: идентификатор проверки для уникальных якорей и ссылки экспорта
     """
     now      = datetime.now().strftime('%d.%m.%Y %H:%M')
     n        = len(reports)
-    thr_pct  = grading.as_percent(threshold)
+    compare = threshold is not None
+    thr_pct = grading.as_percent(threshold) if compare else None
     page_title = _page_title(reports, now)
     anchors = _report_anchors(reports, job_id)
 
@@ -986,38 +990,25 @@ def generate_html_report(reports: list, historical: list,
     cross_session_count = len(cross_session)
 
 
-    matrix_html = _render_matrix(reports, historical_relevant, text_plagiarism, threshold)
+    matrix_section = ''
+    img_summary = ''
+    if compare:
+        matrix_html = _render_matrix(reports, historical_relevant, text_plagiarism, threshold)
+        matrix_section = f'<div class="section"><h2>Матрица схожести текстов</h2>{matrix_html}</div>'
+        img_summary = _render_image_summary(image_plagiarism, report_by_path)
 
 
-    img_summary = _render_image_summary(image_plagiarism, report_by_path)
-
-
+    no_text_paths = set(text_plagiarism.get('no_text') or ())
     cards = ''.join(
         _render_card(r, text_plagiarism, image_plagiarism, threshold,
-                     report_by_path, anchors, weights, scale)
+                     report_by_path, anchors, r['path'] in no_text_paths, weights, scale)
         for r in reports
     )
 
 
-    no_text_paths = set(text_plagiarism.get('no_text') or ())
-
-    def _row_class(r):
-        path = r['path']
-        sim, other = _max_sim(path, matrix)
-        has_plag = (other is not None and sim >= threshold and path not in no_text_paths) or any(
-            p['report1'] == path or p['report2'] == path for p in img_confirmed
-        )
-        p, t = _gost_score(r.get('gost_results', []))
-        if has_plag:              return 'tr-red'
-        if t and p < t * 0.7:     return 'tr-amber'
-        return 'tr-green'
-
-    summary_rows = []
-    for r in reports:
-        path = r['path']
+    def comparison_cells(path, row_no_text):
         sim, sim_other = _max_sim(path, matrix)
-        row_no_text = path in no_text_paths
-
+        text_flagged = sim_other is not None and sim >= threshold and not row_no_text
         other_rep = report_by_path.get(sim_other) if sim > 0 or threshold == 0 else None
         if other_rep and other_rep.get('is_historical'):
             v = other_rep.get('historical_version', '?')
@@ -1034,7 +1025,6 @@ def generate_html_report(reports: list, historical: list,
         else:
             other_name_html = '–'
 
-        p, t = _gost_score(r.get('gost_results', []))
         img_count = sum(
             1 for pair in img_confirmed
             if pair['report1'] == path or pair['report2'] == path
@@ -1047,10 +1037,25 @@ def generate_html_report(reports: list, historical: list,
         if row_no_text:
             plag_badge = '<span class="badge badge-blue">текст не извлечён</span>'
             other_name_html = 'сравнение не проводилось'
-        elif sim_other is not None and sim >= threshold:
+        elif text_flagged:
             plag_badge = f'<span class="badge badge-red">{grading.similarity_percent(sim, threshold)}%</span>'
         else:
             plag_badge = f'<span style="color:var(--muted);">{grading.similarity_percent(sim, threshold)}%</span>'
+        if img_count:
+            img_badge = f'<span class="badge badge-red">{img_count} дублей</span>'
+        elif review_count:
+            img_badge = f'<span class="badge badge-blue">{review_count} на проверку</span>'
+        else:
+            img_badge = '<span style="color:var(--success);">–</span>'
+        cells = f'<td>{plag_badge} → {other_name_html}</td><td>{img_badge}</td>'
+        return cells, text_flagged or bool(img_count)
+
+    summary_rows = []
+    for r in reports:
+        path = r['path']
+        row_no_text = path in no_text_paths
+        cells, flagged = comparison_cells(path, row_no_text) if compare else ('', False)
+        p, t = _gost_score(r.get('gost_results', []))
         if not t:
             gost_badge = '<span class="badge badge-blue">не проверялся</span>'
         elif p == t:
@@ -1058,12 +1063,6 @@ def generate_html_report(reports: list, historical: list,
         else:
             gost_badge = (f'<span class="badge '
                           f'{"badge-amber" if p >= t * 0.7 else "badge-red"}">{p}/{t}</span>')
-        if img_count:
-            img_badge = f'<span class="badge badge-red">{img_count} дублей</span>'
-        elif review_count:
-            img_badge = f'<span class="badge badge-blue">{review_count} на проверку</span>'
-        else:
-            img_badge = '<span style="color:var(--success);">–</span>'
         mark = (None if row_no_text
                 else grading.grade(r.get('gost_results', []), weights, scale))
         if mark is None:
@@ -1082,11 +1081,11 @@ def generate_html_report(reports: list, historical: list,
                 f'{mark_text}</span>'
             )
         anchor = _anchor(r, anchors)
+        row_class = 'tr-red' if flagged else 'tr-amber' if t and p < t * 0.7 else 'tr-green'
         summary_rows.append(
-            f'<tr class="{_row_class(r)}">'
+            f'<tr class="{row_class}">'
             f'<td><a href="#{anchor}">{_esc(_display_name(r))}</a></td>'
-            f'<td>{plag_badge} → {other_name_html}</td>'
-            f'<td>{img_badge}</td>'
+            f'{cells}'
             f'<td>{gost_badge}</td>'
             f'<td>{mark_badge}</td>'
             f'</tr>'
@@ -1097,8 +1096,7 @@ def generate_html_report(reports: list, historical: list,
   <thead>
     <tr>
       <th>Студент</th>
-      <th>Макс. схожесть текста</th>
-      <th>Дубли изображений</th>
+      {'<th>Макс. схожесть текста</th><th>Дубли изображений</th>' if compare else ''}
       <th>ГОСТ</th>
       <th>Оценка за оформление</th>
     </tr>
@@ -1115,6 +1113,19 @@ def generate_html_report(reports: list, historical: list,
     <div class="stat-lbl">Совпадений с базой ({len(historical)} в базе)</div>
   </div>'''
 
+    comparison_stats = ''
+    mode_label = 'Только ГОСТ'
+    if compare:
+        mode_label = f'Заимствования и ГОСТ &nbsp;|&nbsp; Порог заимствования: {thr_pct}%'
+        comparison_stats = f'''
+  <div class="stat-card {'c-red' if flagged_text else 'c-green'}">
+    <div class="stat-num">{flagged_text}</div>
+    <div class="stat-lbl">С заимствованием текста (≥{thr_pct}%)</div>
+  </div>
+  <div class="stat-card {'c-red' if flagged_img else 'c-green'}">
+    <div class="stat-num">{flagged_img}</div>
+    <div class="stat-lbl">С дубликатами изображений</div>
+  </div>'''
 
     if job_id:
         dl_btn = f'<a href="/export/{_esc(job_id)}" class="print-btn">&#11015; Скачать PDF</a>'
@@ -1648,7 +1659,7 @@ a:focus-visible { border-radius: 2px; }
     <p class="subtitle" style="margin:0;">
       Сформировано: {now} &nbsp;|&nbsp;
       Отчётов: {n} &nbsp;|&nbsp;
-      Порог заимствования: {thr_pct}%
+      {mode_label}
     </p>
   </div>
   <div class="toolbar-actions">
@@ -1665,14 +1676,7 @@ a:focus-visible { border-radius: 2px; }
     <div class="stat-num">{n}</div>
     <div class="stat-lbl">Отчётов проверено</div>
   </div>
-  <div class="stat-card {'c-red' if flagged_text else 'c-green'}">
-    <div class="stat-num">{flagged_text}</div>
-    <div class="stat-lbl">С заимствованием текста (≥{thr_pct}%)</div>
-  </div>
-  <div class="stat-card {'c-red' if flagged_img else 'c-green'}">
-    <div class="stat-num">{flagged_img}</div>
-    <div class="stat-lbl">С дубликатами изображений</div>
-  </div>
+  {comparison_stats}
   <div class="stat-card {'c-green' if gost_full == n else 'c-amber'}">
     <div class="stat-num">{gost_full}/{n}</div>
     <div class="stat-lbl">Полностью соответствуют ГОСТ</div>
@@ -1684,10 +1688,7 @@ a:focus-visible { border-radius: 2px; }
   <div class="tbl-wrap">{summary_table}</div>
 </div>
 
-<div class="section">
-  <h2>Матрица схожести текстов</h2>
-  {matrix_html}
-</div>
+{matrix_section}
 
 <h2 style="margin-bottom:var(--space-2);">Детальный анализ по каждому отчёту</h2>
 <p class="subtitle" style="margin-bottom:var(--space-3);">

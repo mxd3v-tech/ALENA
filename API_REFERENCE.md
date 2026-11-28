@@ -93,8 +93,9 @@ Start a check. `multipart/form-data`:
 | Field | Type | Notes |
 |-------|------|-------|
 | `files` | file(s) | One or more `.pdf`, `.docx`, `.odt` or `.doc` files, or a `.zip` of them. Repeat the field for several files. DOCX, ODT and DOC are converted to PDF on the server before checking, so the criteria apply to every format identically; a file that cannot be converted is reported as a card with an error and the rest of the batch is checked as usual. The combined file size must fit `AU_MAX_UPLOAD_MB` (default 5120 MiB). The complete multipart request also has a 600 MiB limit. The web interface can upload larger batches in chunks within the configured batch limit. |
-| `threshold` | float | Text-similarity threshold, `0.0`-`1.0` (default `0.6`). Values outside the range are clamped to it; anything unparsable (`abc`, `NaN`, `inf`, empty) falls back to the default instead of failing the request. |
-| `gost` | string | Optional comma-separated GOST check codes to evaluate, e.g. `S1,S3,F7,F9`. Omit the field to run all 22 checks; an empty value runs none. Codes: `S1`-`S9` plus `S5A` (structural elements), `F1`-`F12` (formatting). |
+| `mode` | string | `full` (default) runs the text and image comparisons and the selected GOST checks. `gost_only` runs the selected GOST checks. Both modes save reports and fingerprints for future comparisons. Unknown modes return HTTP 400. |
+| `threshold` | float | Text-similarity threshold for `full`, `0.0`–`1.0` (default `0.6`). Values outside the range are clamped. An unparsable value falls back to the default. |
+| `gost` | string | Optional comma-separated GOST check codes, e.g. `S1,S3,F7,F9`. Omit the field for all 22 criteria. An empty selection skips GOST in `full`. In `gost_only`, an explicit selection must include at least one recognised code or the server returns HTTP 400. Codes are `S1`–`S9` plus `S5A` (structure) and `F1`–`F12` (formatting). |
 | `use_memory` | string | Optional. `0`/`false` skips plagiarism comparison against the stored fingerprint base (only files within the batch are compared). New reports are still added to the base. Default `1`. |
 | `weights` | string | Optional per-criterion weight for the recommended grade, `0`-`100` each: `S1:100,F1:20,F2:100`. Codes not listed keep `100`. The weights of the criteria actually selected are normalised to sum to 100. Omit the field to use the weights set by the administrator. |
 | `scale` | int | Optional grade scale, `2`-`100`. Omitting it uses the grade scale saved by the administrator (initially `100`). A scale of `100` shows percentages. Other scales also show the grade in points. |
@@ -180,6 +181,14 @@ means the check was stopped on request (see `POST /jobs/<id>/cancel`) and has no
 report and no summary. `summary` is `null` until the check finishes;
 `matches[].pct` is `null` for duplicate images, which are a yes/no match rather
 than a share of the text.
+
+The job's `mode` identifies the selected check. Historical jobs use `full`.
+In `gost_only`, the server skips comparisons within the batch and against the
+archive, including when `use_memory=1`. The job's `text_pairs`, `img_pairs`
+and `threshold` are `null`. The summary's `threshold`, `matches_total`,
+`plag` and `plag_flagged` are also `null`, as are the per-student borrowing
+fields. `matches` is an empty array. GOST scores, grades and feedback use
+the same criteria and weights in both modes.
 
 `summary.groups` lists all identified groups in the uploaded batch. The older
 `group` field contains the first group in sorted order, or `–` for an ungrouped

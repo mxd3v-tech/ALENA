@@ -298,9 +298,11 @@
     // Та же строка, что и в checker/grading.py: отзыв должен совпадать с тем,
     // что напечатано в HTML-отчёте.
     if (st.no_text) {
-      lines.push('Текст из файла не извлекается – скорее всего это скан или '
-        + 'нестандартные шрифты. Заимствование автоматически не проверено, '
-        + 'рекомендуемая оценка за оформление не выводится; нужна ручная проверка');
+      lines.push(thr == null
+        ? 'Текст из файла не извлекается в достаточном объёме. Проверьте оформление и выставьте оценку вручную.'
+        : 'Текст из файла не извлекается – скорее всего это скан или '
+          + 'нестандартные шрифты. Заимствование автоматически не проверено, '
+          + 'рекомендуемая оценка за оформление не выводится; нужна ручная проверка');
     }
     if (st.plag != null && thr != null && (st.plag_flagged ?? (st.plag >= thr))) {
       lines.push(`Совпадение с другой работой – ${st.plag}% (допустимый порог ${thr}%)`);
@@ -438,7 +440,7 @@
     const canDeleteAll = checksRoot.dataset.canDeleteAll === '1';
     const login = checksRoot.dataset.login || '';
     let records = {};
-    let selected = null;
+    let selected = new URLSearchParams(window.location.search).get('job');
     let query = '';
     let timer = null;
     let foldOpen = false;
@@ -510,6 +512,7 @@
         if (j.status === 'processing') { tone = 'idle'; right = chip('idle', (j.progress || 0) + '%'); }
         else if (j.status === 'cancelled') { tone = 'idle'; right = chip('idle', 'Прервана'); }
         else if (j.status === 'error') { tone = 'crit'; right = chip('crit', 'Ошибка'); }
+        else if (j.mode === 'gost_only') { tone = gostTone(s.gost); right = chip(tone, 'ГОСТ ' + gostScore(s.gost)); }
         else { tone = plagTone(s.plag || 0, thr, s.plag_flagged); right = chip(tone, 'Заимств. ' + (s.plag || 0) + '%'); }
 
         return `<li role="option" aria-selected="${j.id === selected}">
@@ -520,7 +523,8 @@
             </span>
             <span class="job-meta">
               <span class="mono">${j.total || 0}</span> файлов
-              ${j.status === 'done' ? `· ГОСТ <span class="mono">${gostScore(s.gost)}</span>` : ''}
+              ${j.mode === 'gost_only' ? '· Только ГОСТ'
+                : j.status === 'done' ? `· ГОСТ <span class="mono">${gostScore(s.gost)}</span>` : ''}
               <span style="margin-left:auto;">${right}</span>
             </span>
             <span class="job-meta"><span class="mono">${esc(j.created_at || '')}</span>${seesAll && j.owner_fio ? ' · ' + esc(j.owner_fio) : ''}</span>
@@ -530,6 +534,9 @@
       $$('#job-list .job').forEach(b => b.onclick = () => {
         if (b.dataset.job === selected) return;
         selected = b.dataset.job;
+        const url = new URL(window.location.href);
+        url.searchParams.set('job', selected);
+        window.history.replaceState(null, '', url);
         foldOpen = false;
         matchOpen = new Set();
         const pane = $('#detail-pane');
@@ -546,21 +553,23 @@
       const done = list.filter(j => j.status === 'done' && j.summary);
       const files = list.reduce((n, j) => n + (j.done_files ?? (j.status === 'done' ? j.total : 0) ?? 0), 0);
       const gosts = done.map(j => j.summary.gost).filter(v => v != null);
-      const matches = done.reduce((n, j) =>
+      const compared = done.filter(j => j.mode !== 'gost_only');
+      const matches = compared.reduce((n, j) =>
         n + (j.summary.matches_total != null
           ? j.summary.matches_total : (j.summary.matches || []).length), 0);
       const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
       set('#t-checks', list.length);
       set('#t-files', files);
       set('#t-gost', gosts.length ? Math.round(gosts.reduce((a, b) => a + b, 0) / gosts.length) + '%' : '–');
-      set('#t-match', matches);
+      set('#t-match', compared.length ? matches : '–');
     }
 
     function renderDetail(j) {
       const pane = $('#detail-pane');
       if (!j) { pane.innerHTML = '<div class="empty">Выберите проверку.</div>'; return; }
       const s = j.summary || {};
-      const thr = s.threshold ?? j.threshold ?? 60;
+      const compare = j.mode !== 'gost_only';
+      const thr = compare ? (s.threshold ?? j.threshold ?? 60) : null;
       const ownsJob = j.owner === login;
       const mayDeleteJob = (ownsJob && canDelete) || (!ownsJob && canDeleteAll);
 
@@ -577,7 +586,8 @@
             <span><b class="mono">${j.total || 0}</b> отчётов</span>
             <span><b class="mono">${esc(j.created_at || '')}</b></span>
             ${j.owner_fio ? `<span>Преподаватель: <b>${esc(j.owner_fio)}</b></span>` : ''}
-            <span>Порог: <b class="mono">${thr}%</b></span>
+            <span>${compare ? 'Заимствования и ГОСТ' : 'Только ГОСТ'}</span>
+            ${compare ? `<span>Порог: <b class="mono">${thr}%</b></span>` : ''}
           </div>
           <div class="detail-actions">
             ${j.status === 'done' ? `
@@ -598,8 +608,8 @@
             <div class="track big"><div class="fill" style="width:${j.progress || 0}%;--tone:var(--brand)"></div></div>
             <div class="stat-row">
               <span class="stat-chip">Извлечено: <b>${j.done_files || 0} / ${j.total || 0}</b></span>
-              <span class="stat-chip">Пар текста: <b>${j.text_pairs || 0}</b></span>
-              <span class="stat-chip">Дублей изображений: <b>${j.img_pairs || 0}</b></span>
+              ${compare ? `<span class="stat-chip">Пар текста: <b>${j.text_pairs || 0}</b></span>
+              <span class="stat-chip">Дублей изображений: <b>${j.img_pairs || 0}</b></span>` : ''}
             </div>
             <p class="hint" style="margin:14px 0 0;">Можно закрыть страницу – проверка продолжится на сервере,
               результат появится в списке.</p>
@@ -654,21 +664,21 @@
               ${chip(gt, gt === 'idle' ? 'ГОСТ не проверялся' : gt === 'ok' ? 'В норме' : gt === 'warn' ? 'Есть замечания' : 'Много нарушений')}</div>
           </div>
           ${markMeter}
-          <div>
+          ${compare ? `<div>
             <div class="meter-top"><span class="meter-label">Максимальное заимствование</span>
               <span class="meter-val" style="color:${toneVar(pt)}">${s.plag || 0}%</span></div>
             <div class="track"><div class="fill" style="width:${s.plag || 0}%;--tone:${toneVar(pt)}"></div></div>
             <div class="meter-note">Порог ${thr}%
               ${chip(pt, pt === 'crit' ? 'Порог достигнут' : pt === 'warn' ? 'Близко к порогу'
                 : thr === 0 ? 'Нет сравнимых пар' : 'Ниже порога')}</div>
-          </div>
+          </div>` : ''}
         </div>`;
 
       const students = (s.students || []).map((st, i) => {
         const fb = `<td class="act"><button class="btn sm" data-fb="${i}">Отзыв</button></td>`;
         if (st.error) {
           return `<tr><td>${esc(st.fio)}</td><td class="num">–</td><td class="num">–</td>
-            <td class="num">–</td>
+            ${compare ? '<td class="num">–</td>' : ''}
             <td><span class="code">не обработан: ${esc(st.error)}</span></td>${fb}</tr>`;
         }
         const a = gostTone(st.gost);
@@ -684,7 +694,7 @@
           <td class="num" style="color:${toneVar(a)}">${gostScore(st.gost)}</td>
           <td class="num" style="color:${toneVar(mt2)}"><b>${g.pct == null ? '–' : g.pct + '%'}</b>
             ${g.score != null ? `<br><span class="sub mono">${g.score} из ${g.scale}</span>` : ''}</td>
-          ${plagCell}
+          ${compare ? plagCell : ''}
           <td>${st.no_text
             ? '<span class="code">текст не извлечён – проверить вручную</span> '
             : ''}${st.fails.length
@@ -702,7 +712,7 @@
         ? `<p class="sub" style="padding:12px var(--space-5);margin:0;">Показаны ${shownMatches}
              самых заметных совпадений из ${totalMatches}. Полный список – в отчёте.</p>`
         : '';
-      const people = groupMatches(s.matches, s.students);
+      const people = compare ? groupMatches(s.matches, s.students) : [];
       const matches = people.length ? people.map(p => `
         <div class="fold">
           <button class="fold-head" type="button" data-mfold="${esc(p.key)}"
@@ -737,16 +747,16 @@
           <div class="fold-body"><div>
             <div class="tbl-wrap"><table>
               <thead><tr><th>Студент</th><th class="num">ГОСТ</th><th class="num">Оценка</th>
-                <th class="num">Заимств.</th><th>Замечания</th><th></th></tr></thead>
-              <tbody>${students || '<tr><td colspan="6" class="empty">Нет данных.</td></tr>'}</tbody>
+                ${compare ? '<th class="num">Заимств.</th>' : ''}<th>Замечания</th><th></th></tr></thead>
+              <tbody>${students || `<tr><td colspan="${compare ? 6 : 5}" class="empty">Нет данных.</td></tr>`}</tbody>
             </table></div>
           </div></div>
         </div>
-        <div class="section-head"><h2>Совпадения</h2><span class="spacer"></span>
+        ${compare ? `<div class="section-head"><h2>Совпадения</h2><span class="spacer"></span>
           ${people.length ? `<span class="eyebrow">${people.length}
             ${plural(people.length, ['работа', 'работы', 'работ'])} с совпадениями</span>` : ''}</div>
         <div class="match-list">${matches}</div>
-        ${moreMatches}
+        ${moreMatches}` : ''}
         ${fails.length ? `<details class="violations">
           <summary>Какие критерии ГОСТ чаще всего не пройдены в этой пачке</summary>
           <div class="viol-body">${fails.map(([code, n]) => `<span class="code">${esc(code)} · ${n}</span>`).join('')}</div>
@@ -898,6 +908,8 @@
     const fileList = $('#file-list');
     const startBtn = $('#start-btn');
     const thr = $('#threshold');
+    const modes = $$('input[name="mode"]');
+    const selectedMode = () => modes.find(input => input.checked).value;
 
     const mb = bytes => (bytes / 1048576).toFixed(1);
     const limitMb = parseInt(uploadForm.dataset.maxMb || '0', 10);
@@ -911,6 +923,20 @@
     let locked = false;
 
     let readingFolders = 0;
+    const updateStart = () => {
+      const needsCriterion = selectedMode() === 'gost_only' && !$('.gost-cb:checked');
+      $('#gost-required').hidden = !needsCriterion;
+      startBtn.disabled = locked || readingFolders > 0 || !picked.length || overLimit || needsCriterion;
+    };
+    const updateMode = () => {
+      const compare = selectedMode() === 'full';
+      $('#comparison-settings').hidden = !compare;
+      thr.disabled = !compare || locked;
+      $('#use-memory').disabled = !compare || locked;
+      updateStart();
+    };
+    modes.forEach(input => input.addEventListener('change', updateMode));
+    updateMode();
     const droppedPaths = new WeakMap();
     const filePath = f => droppedPaths.get(f) || f.webkitRelativePath || f.name;
     const same = (a, b) => filePath(a) === filePath(b) && a.size === b.size
@@ -951,7 +977,7 @@
         b.disabled = locked;
         b.onclick = () => { picked.splice(+b.dataset.drop, 1); showFiles(); };
       });
-      startBtn.disabled = locked || readingFolders > 0 || !picked.length || overLimit;
+      updateStart();
     };
 
     for (const picker of [input, folder]) {
@@ -1014,6 +1040,7 @@
       const n = $$('.gost-cb:checked').length;
       $('#gost-count').textContent = `${n} из ${$$('.gost-cb').length}`;
       recalcWeights();
+      updateStart();
     };
     $$('.gost-cb').forEach(cb => cb.onchange = countGost);
     $('#gost-all').onclick = () => { $$('.gost-cb').forEach(c => c.checked = true); countGost(); };
@@ -1036,12 +1063,13 @@
        ушли на сервер вместе с файлами, и сдвинутый ползунок или снятая галочка
        на идущую проверку не влияют – а выглядит так, будто влияют. Кнопку
        «Прервать» и показ весов не трогаем: смотреть и останавливать можно. */
-    const LOCKABLE = '#file-input,#folder-input,#choose-folder,#threshold,#use-memory,.gost-cb,.w-in,'
+    const LOCKABLE = '#file-input,#folder-input,#choose-folder,input[name="mode"],.gost-cb,.w-in,'
       + '#grade-scale,#gost-all,#gost-none,#w-equal';
 
     const setLocked = on => {
       locked = on;
       $$(LOCKABLE).forEach(el => { el.disabled = on; });
+      updateMode();
       zone.classList.toggle('off', on);
       uploadForm.classList.toggle('locked', on);
       showFiles();          // крестики «убрать файл» и кнопка запуска – там же
@@ -1183,6 +1211,7 @@
 
     const showRun = j => {
       setBar(UPLOAD_SHARE + (j.progress || 0) * (100 - UPLOAD_SHARE) / 100, j.step || '');
+      $$('[data-run-comparison]').forEach(el => { el.hidden = j.mode === 'gost_only'; });
       $('#run-files').textContent = `${j.done_files || 0} / ${j.total || 0}`;
       $('#run-pairs').textContent = j.text_pairs || 0;
       $('#run-imgs').textContent = j.img_pairs || 0;
@@ -1203,7 +1232,7 @@
 
       const finish = j => {
         watched = null;
-        if (redirect) { window.location.href = '/'; return; }
+        if (redirect) { window.location.href = '/?job=' + encodeURIComponent(jobId); return; }
         setLocked(false);
         runHint.hidden = true;
         cancelBtn.hidden = true;
@@ -1261,6 +1290,7 @@
         return;
       }
       if (!list.length || watched || locked) return;
+      modes.forEach(input => { input.checked = input.value === (list[0].mode || 'full'); });
       showRun(list[0]);
       watch(list[0].job_id, false);
     };
@@ -1301,9 +1331,17 @@
       }
 
       const data = new FormData();
-      data.append('threshold', (thr.value / 100).toFixed(2));
+      const mode = selectedMode();
+      if (mode === 'gost_only' && !$('.gost-cb:checked')) {
+        toast('Выберите хотя бы один критерий ГОСТ.');
+        return;
+      }
+      data.append('mode', mode);
+      if (mode === 'full') {
+        data.append('threshold', (thr.value / 100).toFixed(2));
+        data.append('use_memory', $('#use-memory').checked ? '1' : '0');
+      }
       data.append('gost', $$('.gost-cb:checked').map(c => c.value).join(','));
-      data.append('use_memory', $('#use-memory').checked ? '1' : '0');
       data.append('weights', $$('.w-in').map(i => `${i.dataset.code}:${i.value || 0}`).join(','));
       const scale = $('#grade-scale');
       if (scale) data.append('scale', scale.value);
@@ -1312,6 +1350,7 @@
       watched = null;
       aborting = false;
       panel.hidden = false;
+      showRun({mode});
       /* Кнопка запуска – внизу длинной формы, а лист ожидания появляется
          вверху. Без прокрутки казалось бы, что нажатие ничего не сделало.
          Прокручивается не окно, а .scroll: у .app высота в экран. */

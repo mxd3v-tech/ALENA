@@ -47,7 +47,7 @@ def _where(report: dict) -> str:
 
 
 def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
-          threshold: float, weights: dict = None,
+          threshold: float | None, weights: dict = None,
           scale: int = grading.DEFAULT_SCALE) -> dict:
     """Digest of one finished check. `reports` are the freshly uploaded ones.
 
@@ -60,6 +60,7 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
     work_ids = {path: index for index, path in enumerate(by_path, 1)}
     matrix = text_plag.get('matrix', {}) or {}
     no_text = set(text_plag.get('no_text') or ())
+    compare = threshold is not None
     weights = weights or {}
 
     students = []
@@ -72,7 +73,7 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
                 'group':   _group_of(r),
                 'gost':    None,
                 'plag':    None,
-                'plag_flagged': False,
+                'plag_flagged': False if compare else None,
                 'no_text': False,
                 'fails':   [],
                 'flaws':   [],
@@ -95,8 +96,10 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
             'fio':     _display_name(r),
             'group':   _group_of(r),
             'gost':    _gost_pct(r),
-            'plag':    None if unreadable else grading.similarity_percent(worst, threshold),
-            'plag_flagged': bool(row) and not unreadable and worst >= threshold,
+            'plag':    (grading.similarity_percent(worst, threshold)
+                        if compare and not unreadable else None),
+            'plag_flagged': (bool(row) and not unreadable and worst >= threshold
+                             if compare else None),
             'no_text': unreadable,
             'fails':   _failed_codes(r),
             'flaws':   grading.flaws(results),
@@ -196,13 +199,13 @@ def build(reports: list, historical: list, text_plag: dict, img_plag: dict,
         'groups':      groups,
         'group':       groups[0] if groups else '–',
         'gost':        round(sum(s['gost'] for s in scored) / len(scored)) if scored else None,
-        'plag':        max(plags, default=0),
-        'plag_flagged': any(s['plag_flagged'] for s in students),
+        'plag':        max(plags, default=0) if compare else None,
+        'plag_flagged': any(s['plag_flagged'] for s in students) if compare else None,
         'no_text':     sum(1 for s in students if s.get('no_text')),
-        'threshold':   grading.as_percent(threshold),
+        'threshold':   grading.as_percent(threshold) if compare else None,
         'students':    students,
         'matches':     matches,
-        'matches_total': matches_total,
+        'matches_total': matches_total if compare else None,
         'fail_counts': fails.most_common(),
         'clean':       sum(1 for s in scored if not s['fails']),
         'grade':       grade_pct,

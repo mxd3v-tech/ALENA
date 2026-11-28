@@ -63,7 +63,7 @@ from checker import (accounts, branding, convert, db, grading, job_store,
 from checker.extractor        import extract_report
 from checker.gost             import check_gost, GOST_CHECKS, ALL_CODES, FLAW_TEXT
 from checker.job_store        import JOB_ID_RE
-from checker.text_plagiarism  import check_text_plagiarism
+from checker.text_plagiarism  import check_text_plagiarism, has_comparable_text, normalize_text
 from checker.image_plagiarism import check_image_plagiarism
 from checker.reporter         import (REPORT_CSP, generate_html_report,
                                       archived_report_controls, pdf_resource_fetcher)
@@ -820,6 +820,7 @@ def _public_job(job: dict) -> dict:
     """
     data = {k: v for k, v in job.items()
             if k != 'report_html' and not k.startswith('_')}
+    data.setdefault('mode', 'full')
     summary = data.get('summary')
     if summary and 'groups' not in summary:
         labels = [summary.get('group'), *(s.get('group') for s in summary.get('students', []))]
@@ -1255,8 +1256,9 @@ def _overview_stats(user) -> dict:
                 for d in records.values())
     gost_values = [s['gost'] for s in summaries if s.get('gost') is not None]
     grade_values = [s['grade'] for s in summaries if s.get('grade') is not None]
+    compared = [d['summary'] for d in done if d.get('summary') and d.get('mode') != 'gost_only']
     flagged = sum(s['matches_total'] if s.get('matches_total') is not None else len(s.get('matches', []))
-                  for s in summaries)
+                  for s in compared) if compared else None
     clean = sum(s.get('clean', 0) for s in summaries)
     scored = sum(st.get('gost') is not None for s in summaries for st in s.get('students', []))
 
@@ -1339,6 +1341,24 @@ def _grade_params(form) -> tuple:
         or grading.clean_weights(conf.get('gost_weights'))
     scale = grading.clean_scale(form.get('scale') or conf.get('grade_scale'))
     return weights, scale
+
+
+def _check_options(form) -> dict:
+    mode = form.get('mode', 'full')
+    if mode not in ('full', 'gost_only'):
+        abort(400, description='Неизвестный режим проверки. Выберите full или gost_only.')
+    enabled = _parse_enabled_checks(form.get('gost'))
+    if mode == 'gost_only' and enabled == []:
+        abort(400, description='Выберите хотя бы один критерий ГОСТ.')
+    weights, scale = _grade_params(form)
+    return {
+        'threshold': (_float_field(form, 'threshold', 0.6, 0.0, 1.0)
+                      if mode == 'full' else None),
+        'use_memory': mode == 'full' and _parse_use_memory(form.get('use_memory')),
+        'enabled_checks': enabled,
+        'weights': weights,
+        'scale': scale,
+    }
 
 
 # Предел длины имени файла. Файловые системы меряют его в байтах, а не в
@@ -1532,7 +1552,7 @@ def _upload_limit_message():
     return f'Объём партии больше допустимых {UPLOAD_MAX_MB} МБ'
 
 
-def _start_job(uploaded, threshold: float, owner, enabled_checks=None,
+def _start_job(uploaded, threshold: float | None, owner, enabled_checks=None,
                use_memory=True, weights=None, scale=grading.DEFAULT_SCALE):
     """Принять файлы одним запросом и запустить проверку.
 
@@ -1563,11 +1583,12 @@ def _start_job(uploaded, threshold: float, owner, enabled_checks=None,
                    weights, scale)
 
 
-def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
+def _launch(tmp_dir: str, threshold: float | None, owner, enabled_checks=None,
             use_memory=True, weights=None, scale=grading.DEFAULT_SCALE):
     """Пересчитать принятые файлы и запустить поток проверки.
 
     enabled_checks: list of GOST check codes to evaluate, or None for all.
+    threshold: None for a GOST-only check. Zero is a valid comparison threshold.
     use_memory: when False, skip comparison against stored fingerprints
     (new reports are still added to the base).
     weights/scale: «процент использования» каждого критерия и шкала оценки.
@@ -1603,13 +1624,14 @@ def _launch(tmp_dir: str, threshold: float, owner, enabled_checks=None,
         'step':       f'Файлы приняты: {expected} шт. Подготовка…',
         'total':      expected,
         'done_files': 0,
-        'text_pairs': 0,
-        'img_pairs':  0,
+        'mode':       'gost_only' if threshold is None else 'full',
+        'text_pairs': None if threshold is None else 0,
+        'img_pairs':  None if threshold is None else 0,
         'created_at': datetime.now().strftime('%d.%m.%Y %H:%M'),
         'beat':       time.time(),
         'owner':      owner['login'],
         'owner_fio':  owner.get('fio', owner['login']),
-        'threshold':  grading.as_percent(threshold),
+        'threshold':  grading.as_percent(threshold) if threshold is not None else None,
         'summary':    None,
         'error':      None,
     }
@@ -1838,13 +1860,8 @@ def _memory_delete(key: str):
 @app.route('/upload', methods=['POST'])
 @permission_required('run_checks')
 def upload():
-    threshold = _float_field(request.form, 'threshold', 0.6, 0.0, 1.0)
-    enabled = _parse_enabled_checks(request.form.get('gost'))
-    use_memory = _parse_use_memory(request.form.get('use_memory'))
-    weights, scale = _grade_params(request.form)
     job_id, error, status_code = _start_job(
-        request.files.getlist('files'), threshold, g.user, enabled, use_memory,
-        weights, scale)
+        request.files.getlist('files'), owner=g.user, **_check_options(request.form))
     if error:
         return jsonify({'error': error}), status_code
     return jsonify({'job_id': job_id})
@@ -1958,14 +1975,10 @@ def upload_part(upload_id, slot):
 @_with_upload
 def upload_finish(upload_id, slot):
     """Закрыть загрузку и запустить проверку по собранным файлам."""
-    threshold = _float_field(request.form, 'threshold', 0.6, 0.0, 1.0)
-    enabled = _parse_enabled_checks(request.form.get('gost'))
-    use_memory = _parse_use_memory(request.form.get('use_memory'))
-    weights, scale = _grade_params(request.form)
+    options = _check_options(request.form)
     with uploads_lock:
         del uploads[upload_id]
-    job_id, error, status_code = _launch(
-        slot['dir'], threshold, g.user, enabled, use_memory, weights, scale)
+    job_id, error, status_code = _launch(slot['dir'], owner=g.user, **options)
     if error:
         return jsonify({'error': error}), status_code
     return jsonify({'job_id': job_id})
@@ -2487,7 +2500,32 @@ def _publish_job(job_id, owner, html, reports, completed):
         staged.unlink(missing_ok=True)
 
 
-def _process_job(job_id: str, tmp_dir: str, threshold: float,
+def _compare_reports(job_id: str, reports: list, historical: list, threshold: float) -> tuple:
+    """Compare newly submitted works with each other and the selected archive."""
+    _stop_point(job_id)
+    n = len(reports)
+    pairs_count = n * (n - 1) // 2 + n * len(historical)
+    _update(job_id, progress=52, step=f'Анализ текста ({pairs_count} пар, вкл. базу)…')
+    batch = reports + historical
+    text_plag = check_text_plagiarism(
+        batch, threshold=threshold,
+        on_progress=lambda done, total: _tick(
+            job_id, 52, 75, done, total, f'Анализ текста: {done} из {total} пар…'))
+    flagged = len(text_plag['pairs'])
+    _update(job_id, progress=75, text_pairs=flagged,
+            step=f'Текст: {flagged} подозрительных пар')
+
+    _stop_point(job_id)
+    total_imgs = sum(len(r.get('images', [])) for r in reports)
+    _update(job_id, progress=76, step=f'Анализ изображений ({total_imgs} шт.)…')
+    img_plag = check_image_plagiarism(
+        batch, on_progress=lambda done, total: _tick(
+            job_id, 76, 88, done, total, f'Анализ изображений: {done} из {total} пар…'))
+    _update(job_id, img_pairs=sum(not p.get('ui_review') for p in img_plag['pairs']))
+    return text_plag, img_plag
+
+
+def _process_job(job_id: str, tmp_dir: str, threshold: float | None,
                  owner: str, enabled_checks=None, use_memory=True,
                  weights=None, scale=grading.DEFAULT_SCALE):
     with jobs_lock:
@@ -2507,19 +2545,21 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
             return
         _update(job_id, progress=4, total=n, step=f'К проверке принято работ: {n}')
 
-        # 1. Snapshot the fingerprint base visible to this teacher.
-        if use_memory:
+        # 1. A full check snapshots the visible base before extracting this batch.
+        compare = threshold is not None
+        store = {}
+        if compare and use_memory:
             store = load_store(teams.visible_owners(owner))
             _update(job_id, progress=5, step=f'База загружена: {len(store)} записей')
-        else:
-            store = {}
+        elif compare:
             _update(job_id, progress=5, step='Сравнение с базой отключено')
 
         # 2. Extract
         _stop_point(job_id)
         reports = []
+        extract_end, gost_end = (44, 52) if compare else (70, 88)
         for i, path in enumerate(pdf_paths):
-            _tick(job_id, 5, 44, i, n,
+            _tick(job_id, 5, extract_end, i, n,
                   f'Извлечение {i+1} из {n}: {origins.get(path, "")[:60]}…')
             reports.append(extract_report(path, origins.get(path, '')))
             _update(job_id, done_files=i + 1)
@@ -2528,49 +2568,26 @@ def _process_job(job_id: str, tmp_dir: str, threshold: float,
         # ведомости незаметно для преподавателя.
         for path, reason in failures:
             reports.append(extract_report(path, origins.get(path, ''), reason))
-        _update(job_id, progress=44, step='Извлечение завершено', done_files=n)
+        _update(job_id, progress=extract_end, step='Извлечение завершено', done_files=n)
 
         # 3. GOST
         for i, r in enumerate(reports):
-            _tick(job_id, 44, 52, i, n,
+            _tick(job_id, extract_end, gost_end, i, n,
                   f'Проверка ГОСТ 7.32-2017: {i+1} из {n}…')
             r['gost_results'] = check_gost(r, enabled_checks)
 
-        # 4. Both detectors exclude self-comparisons per pair. A submission
-        # by one student can still match another student's work in this batch.
         historical = [to_virtual_report(k, v) for k, v in store.items()]
-        if use_memory:
-            _update(job_id, step=f'Сравниваем с базой: {len(historical)} записей')
+        if compare:
+            if use_memory:
+                _update(job_id, step=f'Сравниваем с базой: {len(historical)} записей')
+            text_plag, img_plag = _compare_reports(job_id, reports, historical, threshold)
+        else:
+            # The grade still requires readable text, even without a similarity search.
+            text_plag = {'no_text': [r['path'] for r in reports if not r.get('error')
+                                     and not has_comparable_text(normalize_text(r['full_text']))]}
+            img_plag = {}
 
-        # 5. Text plagiarism (new + relevant historical)
-        _stop_point(job_id)
-        pairs_count = n * (n - 1) // 2 + n * len(historical)
-        _update(job_id, progress=52,
-                step=f'Анализ текста ({pairs_count} пар, вкл. базу)…')
-        text_plag = check_text_plagiarism(
-            reports + historical, threshold=threshold,
-            on_progress=lambda done, total: _tick(
-                job_id, 52, 75, done, total,
-                f'Анализ текста: {done} из {total} пар…'))
-        flagged = len(text_plag.get('pairs', []))
-        _update(job_id, progress=75, text_pairs=flagged,
-                step=f'Текст: {flagged} подозрительных пар')
-
-        # 6. Image plagiarism (new + historical)
-        _stop_point(job_id)
-        total_imgs = sum(len(r.get('images', [])) for r in reports)
-        _update(job_id, progress=76,
-                step=f'Анализ изображений ({total_imgs} шт.)…')
-        img_plag = check_image_plagiarism(
-            reports + historical,
-            on_progress=lambda done, total: _tick(
-                job_id, 76, 88, done, total,
-                f'Анализ изображений: {done} из {total} пар…'))
-        img_flagged = len([p for p in img_plag.get('pairs', [])
-                           if not p.get('ui_review')])
-        _update(job_id, img_pairs=img_flagged)
-
-        # 7. Render the report. Publication checks cancellation again under jobs_lock.
+        # Both modes publish the report and its fingerprints together.
         _stop_point(job_id)
         _update(job_id, progress=88, step='Генерация HTML-отчёта…')
         html = generate_html_report(
@@ -2615,7 +2632,8 @@ api = Blueprint('api', __name__, url_prefix='/api/v1')
 
 @app.errorhandler(HTTPException)
 def http_error(exc):
-    if request.path != '/api/v1' and not request.path.startswith('/api/v1/'):
+    if (request.path not in ('/upload', '/upload/finish', '/api/v1')
+            and not request.path.startswith('/api/v1/')):
         return exc
     response = exc.get_response()  # Includes Allow for method errors.
     response.set_data(app.json.dumps({'error': exc.description, 'status': exc.code}))
@@ -2632,20 +2650,15 @@ def api_health():
 @api_auth_required
 def api_create_job():
     """Start a check. Multipart form: files=<pdf|docx|odt|doc|zip>… ,
-    threshold=0.0-1.0,
+    mode=full|gost_only (optional; default full), threshold=0.0-1.0,
     gost=<comma-separated check codes> (optional; omit for all checks),
     use_memory=0|1 (optional; 0 skips comparison against the stored base),
     weights=<S1:100,F2:40> (optional; per-criterion weight for the recommended
     grade), scale=<2..100> (optional; grade scale, 100 = percent)."""
     if not accounts.can(g.user, 'run_checks'):
         return jsonify({'error': 'Нет права запускать проверки'}), 403
-    threshold = _float_field(request.form, 'threshold', 0.6, 0.0, 1.0)
-    enabled = _parse_enabled_checks(request.form.get('gost'))
-    use_memory = _parse_use_memory(request.form.get('use_memory'))
-    weights, scale = _grade_params(request.form)
     job_id, error, status_code = _start_job(
-        request.files.getlist('files'), threshold, g.user, enabled, use_memory,
-        weights, scale)
+        request.files.getlist('files'), owner=g.user, **_check_options(request.form))
     if error:
         return jsonify({'error': error}), status_code
     return jsonify({
